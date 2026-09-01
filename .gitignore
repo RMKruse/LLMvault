@@ -2,3 +2,6 @@
 AGENTS.md
 CONTEXT.md
 docs/
+node_modules/
+main.js
+*.map

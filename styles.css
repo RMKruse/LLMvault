@@ -1,0 +1,89 @@
+.llmvault-chat {
+  display: grid;
+  grid-template-rows: auto auto minmax(10rem, 1fr) auto auto;
+  gap: var(--size-4-3);
+  height: 100%;
+  padding: var(--size-4-3);
+  color: var(--text-normal);
+  background: var(--background-primary);
+}
+
+.llmvault-chat__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-2);
+}
+
+.llmvault-chat__header h2,
+.llmvault-chat h3,
+.llmvault-chat p {
+  margin: 0;
+}
+
+.llmvault-chat__local-badge {
+  padding: var(--size-2-1) var(--size-4-2);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.llmvault-chat__setup,
+.llmvault-chat__answer,
+.llmvault-chat__evidence {
+  padding: var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.llmvault-chat__setup {
+  display: grid;
+  gap: var(--size-4-1);
+  border-color: var(--interactive-accent);
+}
+
+.llmvault-chat__answer,
+.llmvault-chat__evidence {
+  display: grid;
+  align-content: start;
+  gap: var(--size-4-2);
+  overflow: auto;
+}
+
+.llmvault-chat__evidence {
+  max-height: 12rem;
+}
+
+.llmvault-chat__placeholder {
+  color: var(--text-muted);
+}
+
+.llmvault-chat__composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--size-4-2);
+}
+
+.llmvault-chat__composer textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.llmvault-chat :focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.llmvault-chat__sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

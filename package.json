@@ -1,0 +1,26 @@
+{
+  "name": "llmvault",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local, vault-aware question answering for Obsidian",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "npm run typecheck && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test:smoke": "npm run build && node --test test/plugin-smoke.test.mjs",
+    "test": "npm run test:smoke"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.9.1",
+    "obsidian": "^1.13.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.69.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
