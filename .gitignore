@@ -7,4 +7,3 @@ main.js
 release-candidate/
 *.map
 evaluation/results/in-progress.json
-evaluation/results/acceptance.json

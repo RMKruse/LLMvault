@@ -37,9 +37,11 @@ Install Node.js 22 or newer, then run:
 npm ci
 npm test
 npm run lint
+npm run quality:run
+npm run acceptance:run -- --vault=/path/to/vault --obsidian=/path/to/Obsidian --chat=CHAT_MODEL --embedding=EMBEDDING_MODEL
 npm run release:build
 ```
 
-The last command performs two production builds, requires byte-identical `main.js` output, verifies the package, manifest, and minimum-version metadata, and writes exactly `main.js`, `manifest.json`, and `styles.css` to `release-candidate/<version>/`. It does not create a tag, publish a release, submit to the Community directory, or contact a service. After all release gates pass, the Git tag must exactly match the manifest version (for example `0.1.0`, not `v0.1.0`).
+The acceptance command runs against a disposable copy of the supplied vault. The last command performs two production builds, requires byte-identical `main.js` output, verifies the package, manifest, and minimum-version metadata, and writes exactly `main.js`, `manifest.json`, and `styles.css` to `release-candidate/<version>/`. It does not create a tag, publish a release, submit to the Community directory, or contact a service. After all release gates pass, the Git tag must exactly match the manifest version (for example `0.1.0`, not `v0.1.0`). Current qualification evidence and pending platform gates are recorded in [RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md).
 
 The released code is licensed under the [MIT License](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md).

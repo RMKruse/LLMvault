@@ -1,0 +1,154 @@
+{
+  "environment": {
+    "hardware": {
+      "architecture": "arm64",
+      "cpu": "Apple M5 Pro",
+      "memoryBytes": 25769803776
+    },
+    "models": {
+      "chat": {
+        "digest": "7c75d6f0f4b974c8761fe291ab4d808754b6a6b1420c60663c519363b49a26e1",
+        "name": "gemma4:12b-mlx"
+      },
+      "embedding": {
+        "digest": "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d",
+        "name": "qwen3-embedding:0.6b"
+      }
+    },
+    "os": {
+      "platform": "darwin",
+      "release": "25.3.0"
+    },
+    "vault": {
+      "bytes": 94963062,
+      "contentFiles": 988,
+      "totalFiles": 1063
+    },
+    "versions": {
+      "node": "v26.5.0",
+      "obsidian": "1.13.7",
+      "ollama": "0.33.2",
+      "plugin": "0.1.0"
+    }
+  },
+  "runs": [
+    {
+      "accounting": {
+        "complete": true,
+        "discovered": 981,
+        "statuses": {
+          "indexed": 892,
+          "no_extractable_text": 26,
+          "unsupported_format": 61,
+          "unrecognized_format": 2
+        },
+        "terminal": 981
+      },
+      "cancellation": {
+        "controlsUsableMs": 0.5,
+        "lateCompleted": false,
+        "lateOutputInjected": true,
+        "latePersisted": false,
+        "noNewTextAfterMs": 0
+      },
+      "failures": {
+        "fatalFailedSourceAbsent": true,
+        "fatalGenerationIsolated": true,
+        "fatalUnrelatedAvailable": true,
+        "oneFileFailedSourceAbsent": true,
+        "oneFileIsolated": true,
+        "oneFileUnrelatedAvailable": true
+      },
+      "indexing": {
+        "ollamaMs": 98707.09999991208,
+        "partialActivated": false,
+        "pluginMs": 3119.900000087917,
+        "totalMs": 101827
+      },
+      "mutation": {
+        "queryIneligibleMs": 0.5999999940395355,
+        "replacementAfterEmbeddingMs": 544.7999999970198
+      },
+      "question": {
+        "embeddingDispatchMs": 15.5,
+        "postEmbeddingMs": 11.800000004470348
+      },
+      "recovery": [
+        {
+          "boundary": "record",
+          "canonical": true,
+          "pluginMs": 2593.99279199999,
+          "converged": true,
+          "exposedInvalidContent": false
+        },
+        {
+          "boundary": "catalog",
+          "canonical": true,
+          "pluginMs": 2536.6375410000037,
+          "converged": true,
+          "exposedInvalidContent": false
+        },
+        {
+          "boundary": "pointer",
+          "canonical": true,
+          "pluginMs": 1296.6230000000069,
+          "converged": true,
+          "exposedInvalidContent": false
+        },
+        {
+          "boundary": "cleanup",
+          "canonical": true,
+          "pluginMs": 1278.5511249999981,
+          "converged": true,
+          "exposedInvalidContent": false
+        }
+      ],
+      "storage": {
+        "containsPlaintextSourceCopy": false,
+        "peakRebuildBytes": 23403327,
+        "settledBytes": 11701636
+      },
+      "ui": {
+        "indexing": {
+          "maximumMs": 73.10000000149012,
+          "p95Ms": 1.8999999985098839,
+          "samples": 3892
+        },
+        "rebuild": {
+          "maximumMs": 7.399999998509884,
+          "p95Ms": 1.7999999970197678,
+          "samples": 49
+        },
+        "reconciliation": {
+          "maximumMs": 55.5,
+          "p95Ms": 3,
+          "samples": 66
+        },
+        "streaming": {
+          "maximumMs": 1.9000000059604645,
+          "p95Ms": 1.5,
+          "samples": 26
+        }
+      },
+      "warm": {
+        "ollamaMs": 0,
+        "pluginMs": 667.6999999955297,
+        "totalMs": 667.6999999955297
+      }
+    }
+  ],
+  "gates": {
+    "environment": true,
+    "referenceVault": true,
+    "indexing": true,
+    "warm": true,
+    "mutation": true,
+    "ui": true,
+    "question": true,
+    "cancellation": true,
+    "recovery": true,
+    "storage": true,
+    "accounting": true
+  },
+  "pass": true
+}
