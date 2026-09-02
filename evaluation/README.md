@@ -1,6 +1,6 @@
 # Synthetic quality-suite fixture
 
-`npm run quality:run` checks the committed fixture manifest, builds the production plugin, and runs all 24 cases three times as fresh conversations through the production extraction, retrieval, prompt, streaming, citation, and rendering logic.
+`npm run quality:run` checks the committed fixture manifest, builds the production plugin, and runs all 24 cases three times as fresh conversations through production extraction, retrieval, prompting, streaming, and citation parsing. Human review is still required for semantic claim support, claim-to-citation association, and UI behavior.
 
 The runner tries `gemma4:12b-mlx` with `qwen3-embedding:0.6b` first and tries `qwen3-embedding:4b` only after a failed candidate. It never weakens a gate. The required models and Ollama must already be installed and running on `127.0.0.1:11434`.
 
