@@ -1,4 +1,4 @@
-import { ItemView, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { ItemView, Plugin, type TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 
 import {
   type IndexSnapshot,
@@ -7,6 +7,7 @@ import {
   type VaultSource,
   type RetrievedEvidence,
   classifyVaultSource,
+  isSupportedVaultExtension,
 } from "./indexing";
 import {
   type LLMvaultSettings,
@@ -63,6 +64,7 @@ class VaultChatView extends ItemView {
   private readonly history: OllamaMessage[] = [];
   private indexEl?: HTMLElement;
   private indexUnsubscribe?: () => void;
+  private mutationUnsubscribe?: () => void;
   private questionEl?: HTMLTextAreaElement;
   private requestGeneration = 0;
   private portValue: string;
@@ -95,6 +97,9 @@ class VaultChatView extends ItemView {
   override onOpen(): Promise<void> {
     this.renderShell();
     this.indexUnsubscribe = this.plugin.subscribeIndex(() => this.renderIndex());
+    this.mutationUnsubscribe = this.plugin.subscribeMutations((paths) => {
+      this.vaultContentChanged(paths);
+    });
     void this.refreshModels();
     return Promise.resolve();
   }
@@ -103,6 +108,7 @@ class VaultChatView extends ItemView {
     this.requestGeneration += 1;
     this.plugin.abortAnswerRequests();
     this.indexUnsubscribe?.();
+    this.mutationUnsubscribe?.();
     this.contentEl.empty();
     return Promise.resolve();
   }
@@ -346,6 +352,34 @@ class VaultChatView extends ItemView {
     }
   }
 
+  private vaultContentChanged(paths: ReadonlySet<string>): void {
+    if (this.answering) {
+      this.requestGeneration += 1;
+      this.answering = false;
+      this.renderAnswer(
+        "Vault Content changed while this answer was running. Its evidence is no longer current; retry when indexing is ready.",
+        "Evidence changed",
+      );
+    }
+    for (const [citationId, evidence] of this.citationRegistry) {
+      if (!paths.has(evidence.path)) continue;
+      for (const element of this.contentEl.querySelectorAll<HTMLElement>("[data-citation-id]")) {
+        if (element.dataset.citationId !== citationId) continue;
+        element.setAttribute("aria-disabled", "true");
+        if (element instanceof HTMLButtonElement) element.disabled = true;
+        if (element.classList.contains("llmvault-chat__citation")) {
+          element.setText(`${citationId} unavailable`);
+        } else if (!element.querySelector(".llmvault-chat__unavailable")) {
+          element.createSpan({
+            cls: "llmvault-chat__unavailable",
+            text: "Unavailable — source changed.",
+          });
+        }
+      }
+    }
+    this.renderComposerState();
+  }
+
   private renderAnswer(
     text: string,
     heading = "Grounded Answer · quality not evaluated for this model",
@@ -369,7 +403,7 @@ class VaultChatView extends ItemView {
       if (this.citationRegistry.has(citationId)) {
         const citation = body.createEl("button", {
           cls: "llmvault-chat__citation",
-          attr: { type: "button" },
+          attr: { "data-citation-id": citationId, type: "button" },
           text: citationId,
         });
         citation.onclick = () => void this.showEvidence(citationId);
@@ -398,7 +432,7 @@ class VaultChatView extends ItemView {
       this.citationRegistry.set(item.citationId, item);
       const card = evidenceEl.createEl("button", {
         cls: "llmvault-chat__source",
-        attr: { type: "button" },
+        attr: { "data-citation-id": item.citationId, type: "button" },
       });
       card.createEl("strong", { text: `${item.citationId} · ${item.path}` });
       card.createSpan({ text: this.evidenceLocation(item) });
@@ -753,7 +787,9 @@ export default class LLMvaultPlugin extends Plugin {
     total: 0,
   };
   private readonly indexSubscribers = new Set<(snapshot: IndexSnapshot) => void>();
+  private readonly mutationSubscribers = new Set<(paths: ReadonlySet<string>) => void>();
   private readonly indexOllama = new OllamaClient();
+  private readonly chatOllama = new OllamaClient();
   private readonly ollama = new OllamaClient();
   private readonly queryOllama = new OllamaClient();
   private llmvaultSettings = normalizeSettings(null);
@@ -817,12 +853,20 @@ export default class LLMvaultPlugin extends Plugin {
       void this.openVaultChat();
     });
 
+    this.registerEvent(this.app.vault.on("create", (file) => this.handleVaultMutation(file)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.handleVaultMutation(file)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.handleVaultMutation(file)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.handleVaultMutation(file, oldPath);
+    }));
+
     this.app.workspace.onLayoutReady(() => void this.restoreIndex());
   }
 
   override onunload(): void {
     this.index?.cancel();
     this.indexOllama.abortAll();
+    this.chatOllama.abortAll();
     this.ollama.abortAll();
     this.queryOllama.abortAll();
     void this.app.workspace.detachLeavesOfType(VIEW_TYPE_VAULT_CHAT);
@@ -854,7 +898,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   abortAnswerRequests(): void {
-    this.ollama.abortAll();
+    this.chatOllama.abortAll();
     this.queryOllama.abortAll();
   }
 
@@ -870,7 +914,7 @@ export default class LLMvaultPlugin extends Plugin {
     if (!settings.chatModel) {
       throw new OllamaError("chat_model_unavailable", "/api/chat");
     }
-    return await this.ollama.chat(
+    return await this.chatOllama.chat(
       settings.ollamaPort,
       settings.chatModel,
       messages,
@@ -883,7 +927,7 @@ export default class LLMvaultPlugin extends Plugin {
     if (!settings.chatModel) {
       throw new OllamaError("chat_model_unavailable", "/api/show");
     }
-    const validation = await this.ollama.validateModel(
+    const validation = await this.chatOllama.validateModel(
       settings.ollamaPort,
       settings.chatModel,
       "completion",
@@ -936,6 +980,11 @@ export default class LLMvaultPlugin extends Plugin {
     return () => this.indexSubscribers.delete(subscriber);
   }
 
+  subscribeMutations(subscriber: (paths: ReadonlySet<string>) => void): () => void {
+    this.mutationSubscribers.add(subscriber);
+    return () => this.mutationSubscribers.delete(subscriber);
+  }
+
   async startIndexing(discovery: OllamaDiscovery, embeddingModel: string): Promise<void> {
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
@@ -976,6 +1025,30 @@ export default class LLMvaultPlugin extends Plugin {
           anchors,
         );
       });
+  }
+
+  private handleVaultMutation(file: TAbstractFile, oldPath?: string): void {
+    if (!(file instanceof TFile)) return;
+    const paths = new Set(
+      [oldPath, file.path].filter(
+        (path): path is string => path !== undefined && this.isSupportedPath(path),
+      ),
+    );
+    if (paths.size === 0 || !this.index) return;
+
+    const rebuild = this.index.invalidate(paths);
+    this.indexOllama.abortAll();
+    this.abortAnswerRequests();
+    for (const subscriber of this.mutationSubscribers) subscriber(paths);
+    void rebuild;
+  }
+
+  private isSupportedPath(path: string): boolean {
+    const configurationRoot = `${this.app.vault.configDir}/`;
+    const extension = path.slice(path.lastIndexOf(".") + 1);
+    return path !== this.app.vault.configDir &&
+      !path.startsWith(configurationRoot) &&
+      isSupportedVaultExtension(extension);
   }
 
   private reportIndex(snapshot: IndexSnapshot): void {

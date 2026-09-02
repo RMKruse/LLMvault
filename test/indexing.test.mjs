@@ -360,6 +360,118 @@ test("a failed replacement keeps partial and prior stale chunks unqueryable", as
   assert.equal([...adapter.files.values()].some((value) => value.includes("replacement")), false);
 });
 
+test("Vault mutations tombstone immediately and serialize to the clean final index", async () => {
+  const adapter = new MemoryAdapter();
+  let text = "original";
+  let blockEmbedding = false;
+  let releaseEmbedding = () => undefined;
+  let signalEmbedding = () => undefined;
+  let activeEmbeddings = 0;
+  let maximumActiveEmbeddings = 0;
+  const embeddingStarted = new Promise((resolve) => { signalEmbedding = resolve; });
+  const embeddingReleased = new Promise((resolve) => { releaseEmbedding = resolve; });
+  const sources = () => [{ path: "Note.md", read: async () => text }];
+  const embed = async (inputs) => {
+    activeEmbeddings += 1;
+    maximumActiveEmbeddings = Math.max(maximumActiveEmbeddings, activeEmbeddings);
+    try {
+      if (blockEmbedding) {
+        signalEmbedding();
+        await embeddingReleased;
+      }
+      return inputs.map(() => [1]);
+    } finally {
+      activeEmbeddings -= 1;
+    }
+  };
+  const model = { name: "embed", digest: "sha256:abc" };
+  const index = new VaultIndex(adapter, "plugin/index-v1", sources, embed);
+  await index.start(model);
+  const [oldEvidence] = await index.retrieve("question");
+
+  text = "intermediate";
+  blockEmbedding = true;
+  const firstMutation = index.invalidate(["Note.md"]);
+  const coalescedMutation = index.invalidate(["Note.md"]);
+
+  assert.equal(firstMutation, coalescedMutation);
+  assert.equal(index.getSnapshot().phase, "indexing");
+  assert.equal(await index.resolveEvidence(oldEvidence), null);
+  assert.deepEqual(await index.retrieve("question"), []);
+
+  await embeddingStarted;
+  text = "final";
+  const mutationDuringIndexing = index.invalidate(["Note.md"]);
+  blockEmbedding = false;
+  releaseEmbedding();
+  await Promise.all([firstMutation, mutationDuringIndexing]);
+
+  const clean = new VaultIndex(
+    new MemoryAdapter(),
+    "plugin/index-v1",
+    sources,
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await clean.start(model);
+  const withoutCitationId = (evidence) => {
+    const result = { ...evidence };
+    delete result.citationId;
+    return result;
+  };
+
+  assert.equal(maximumActiveEmbeddings, 1);
+  assert.deepEqual(index.getSnapshot(), clean.getSnapshot());
+  assert.deepEqual(
+    (await index.retrieve("question")).map(withoutCitationId),
+    (await clean.retrieve("question")).map(withoutCitationId),
+  );
+});
+
+test("a mutation during catalog commit cannot reactivate late evidence", async () => {
+  let signalCommit = () => undefined;
+  let releaseCommit = () => undefined;
+  const commitStarted = new Promise((resolve) => { signalCommit = resolve; });
+  const commitReleased = new Promise((resolve) => { releaseCommit = resolve; });
+  const adapter = new class extends MemoryAdapter {
+    pauseCommit = false;
+
+    async process(path, update) {
+      if (this.pauseCommit) {
+        signalCommit();
+        await commitReleased;
+      }
+      return await super.process(path, update);
+    }
+  }();
+  let text = "original";
+  let countReady = false;
+  let readySnapshots = 0;
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [{ path: "Note.md", read: async () => text }],
+    async (inputs) => inputs.map(() => [1]),
+    (snapshot) => {
+      if (countReady && snapshot.phase === "ready") readySnapshots += 1;
+    },
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+
+  text = "intermediate";
+  adapter.pauseCommit = true;
+  const intermediate = index.invalidate(["Note.md"]);
+  await commitStarted;
+  countReady = true;
+  text = "final";
+  const final = index.invalidate(["Note.md"]);
+  adapter.pauseCommit = false;
+  releaseCommit();
+  await Promise.all([intermediate, final]);
+
+  assert.equal(readySnapshots, 1);
+  assert.equal((await index.retrieve("question"))[0]?.text, "final");
+});
+
 test("plugin-controlled preprocessing timeouts report the observed ceiling", async () => {
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;

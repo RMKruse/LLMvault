@@ -424,7 +424,7 @@ export function classifyVaultSource(
   anchors?: MarkdownAnchor[],
 ): VaultSource {
   const normalized = extension.toLowerCase();
-  if (normalized === "md" || normalized === "canvas") {
+  if (isSupportedVaultExtension(normalized)) {
     return {
       ...(normalized === "md" && anchors ? { anchors } : {}),
       kind: normalized === "md" ? "markdown" : "canvas",
@@ -446,6 +446,11 @@ export function classifyVaultSource(
     rawBytes,
     reason: normalized ? `unknown_extension:${normalized}` : "extensionless",
   };
+}
+
+export function isSupportedVaultExtension(extension: string): boolean {
+  const normalized = extension.toLowerCase();
+  return normalized === "md" || normalized === "canvas";
 }
 
 async function sha256(value: string): Promise<string> {
@@ -799,17 +804,21 @@ function sameLocator(left: StoredLocator, right: StoredLocator): boolean {
 export class VaultIndex {
   private active?: { catalog: Catalog; model: EmbeddingModel };
   private readonly adapter: IndexAdapter;
+  private drain?: Promise<IndexSnapshot>;
   private readonly embed: (
     inputs: string[],
     model: EmbeddingModel,
   ) => Promise<number[][]>;
   private readonly listSources: () => VaultSource[];
   private readonly onProgress: (snapshot: IndexSnapshot) => void;
+  private model?: EmbeddingModel;
+  private readonly pendingPaths = new Set<string>();
   private readonly queryEmbed: (
     inputs: string[],
     model: EmbeddingModel,
   ) => Promise<number[][]>;
   private querySequence = 0;
+  private rebuildQueued = false;
   private replacementQueued = false;
   private revision = 0;
   private readonly root: string;
@@ -836,6 +845,7 @@ export class VaultIndex {
 
   cancel(): void {
     this.revision += 1;
+    this.rebuildQueued = false;
   }
 
   getSnapshot(): IndexSnapshot {
@@ -848,12 +858,14 @@ export class VaultIndex {
 
   async retrieve(question: string): Promise<RetrievedEvidence[]> {
     const active = this.active;
+    const revision = this.revision;
     if (this.snapshot.phase !== "ready" || !active || question.trim().length === 0) {
       return [];
     }
     const dimension = active.catalog.signature.vectorDimension;
     if (dimension === 0) return [];
     const queryVectors = await this.queryEmbed([question], active.model);
+    if (revision !== this.revision) return [];
     const query = queryVectors[0];
     if (!query || query.length !== dimension || query.some((value) => !Number.isFinite(value))) {
       throw new TypeError("invalid_query_embedding");
@@ -870,6 +882,7 @@ export class VaultIndex {
         entry,
         dimension,
       );
+      if (revision !== this.revision) return [];
       if (
         !record ||
         record.chunks.length !== entry.chunkCount ||
@@ -903,6 +916,7 @@ export class VaultIndex {
       const hydrated = source
         ? await this.hydrate(candidate.entry, candidate.chunk, candidate.score, source)
         : null;
+      if (revision !== this.revision) return [];
       if (!hydrated) {
         stale = true;
         continue;
@@ -915,6 +929,7 @@ export class VaultIndex {
   }
 
   async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
+    if (!this.hasEvidence(evidence)) return null;
     const source = this.listSources().find(({ path }) => path === evidence.path);
     if (!source) {
       if (this.active) this.queueReplacement(this.active.model);
@@ -932,8 +947,45 @@ export class VaultIndex {
       vector: "",
     };
     const hydrated = await this.hydrate(entry, chunk, evidence.score, source);
+    if (!this.hasEvidence(evidence)) return null;
     if (!hydrated && this.active) this.queueReplacement(this.active.model);
     return hydrated ? { ...hydrated, citationId: evidence.citationId } : null;
+  }
+
+  // ponytail: rebuild the whole generation; go per-source only if change latency becomes material.
+  invalidate(paths: Iterable<string>): Promise<IndexSnapshot> {
+    for (const path of paths) {
+      if (path) this.pendingPaths.add(path);
+    }
+    if (this.pendingPaths.size === 0) return Promise.resolve(this.getSnapshot());
+
+    this.revision += 1;
+    if (this.active) {
+      this.active.catalog.entries = this.active.catalog.entries.filter(
+        ({ path }) => !this.pendingPaths.has(path),
+      );
+    }
+    this.rebuildQueued = true;
+    if (this.model) {
+      this.update({
+        ...this.snapshot,
+        outcomes: this.snapshot.outcomes.filter(({ path }) => !this.pendingPaths.has(path)),
+        phase: "indexing",
+        statuses: this.active ? statusCounts(this.active.catalog.entries) : {},
+      });
+      return this.queueDrain();
+    }
+    return Promise.resolve(this.getSnapshot());
+  }
+
+  private hasEvidence(evidence: RetrievedEvidence): boolean {
+    return this.active?.catalog.entries.some(
+      (entry) =>
+        entry.status === "indexed" &&
+        entry.path === evidence.path &&
+        entry.fingerprint === evidence.fingerprint &&
+        evidence.chunkId.startsWith(`${entry.sourceKey}:`),
+    ) ?? false;
   }
 
   private queueReplacement(model: EmbeddingModel): void {
@@ -977,8 +1029,35 @@ export class VaultIndex {
     };
   }
 
-  async start(model: EmbeddingModel): Promise<IndexSnapshot> {
-    const revision = ++this.revision;
+  start(model: EmbeddingModel): Promise<IndexSnapshot> {
+    this.model = model;
+    this.rebuildQueued = true;
+    this.revision += 1;
+    if (validModel(model)) {
+      this.update({ ...this.snapshot, phase: "indexing" });
+    }
+    return this.queueDrain();
+  }
+
+  private queueDrain(): Promise<IndexSnapshot> {
+    if (this.drain) return this.drain;
+    this.drain = Promise.resolve()
+      .then(async () => {
+        let result = this.getSnapshot();
+        while (this.rebuildQueued && this.model) {
+          this.rebuildQueued = false;
+          this.pendingPaths.clear();
+          result = await this.run(this.model, this.revision);
+        }
+        return result;
+      })
+      .finally(() => {
+        this.drain = undefined;
+      });
+    return this.drain;
+  }
+
+  private async run(model: EmbeddingModel, revision: number): Promise<IndexSnapshot> {
     if (!validModel(model)) return this.update({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
     const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
     try {
@@ -1056,6 +1135,7 @@ export class VaultIndex {
         }
       }
     }
+    this.assertCurrent(revision);
     this.active = { catalog, model };
     return this.update({
       completed: sources.length,
@@ -1074,6 +1154,7 @@ export class VaultIndex {
     const generationId = globalThis.crypto.randomUUID();
     const generation = await this.ensureDirectories(generationId);
     const entries: SourceEntry[] = [];
+    let catalogCommitted = false;
     let vectorDimension = 0;
     try {
       for (const source of sources) {
@@ -1151,7 +1232,10 @@ export class VaultIndex {
         }
       }
       if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
+      this.assertCurrent(revision);
       await this.adapter.process(activePath, () => JSON.stringify({ generationId }));
+      catalogCommitted = true;
+      this.assertCurrent(revision);
       this.active = { catalog, model };
       const ready = this.update({
         completed: sources.length,
@@ -1165,7 +1249,9 @@ export class VaultIndex {
       }
       return ready;
     } catch (error) {
-      await this.adapter.rmdir(generation, true).catch(() => undefined);
+      if (!catalogCommitted) {
+        await this.adapter.rmdir(generation, true).catch(() => undefined);
+      }
       throw error;
     }
   }
