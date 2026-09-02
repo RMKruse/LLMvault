@@ -173,8 +173,8 @@ class VaultChatView extends ItemView {
         text: this.indexMessage(snapshot),
       });
     }
-    if (this.questionEl) this.questionEl.disabled = !snapshot.active;
-    if (this.askButton) this.askButton.disabled = !snapshot.active;
+    if (this.questionEl) this.questionEl.disabled = snapshot.phase !== "ready";
+    if (this.askButton) this.askButton.disabled = snapshot.phase !== "ready";
   }
 
   private indexMessage(snapshot: IndexSnapshot): string {
@@ -480,7 +480,6 @@ class VaultChatView extends ItemView {
 export default class LLMvaultPlugin extends Plugin {
   private index?: MarkdownIndex;
   private indexSnapshot: IndexSnapshot = {
-    active: false,
     completed: 0,
     phase: "idle",
     statuses: {},
@@ -570,7 +569,7 @@ export default class LLMvaultPlugin extends Plugin {
   async startIndexing(discovery: OllamaDiscovery, embeddingModel: string): Promise<void> {
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
-      this.reportIndex({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ completed: 0, phase: "failed", statuses: {}, total: 0 });
       return;
     }
     this.indexOllama.abortAll();
@@ -619,7 +618,7 @@ export default class LLMvaultPlugin extends Plugin {
         await this.startIndexing(discovery, settings.embeddingModel);
       }
     } catch {
-      this.reportIndex({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ completed: 0, phase: "failed", statuses: {}, total: 0 });
     }
   }
 

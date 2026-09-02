@@ -38,7 +38,6 @@ export interface EmbeddingModel {
 }
 
 export interface IndexSnapshot {
-  active: boolean;
   completed: number;
   latestPath?: string;
   phase: "idle" | "indexing" | "ready" | "failed";
@@ -427,7 +426,7 @@ export class MarkdownIndex {
   private readonly onProgress: (snapshot: IndexSnapshot) => void;
   private revision = 0;
   private readonly root: string;
-  private snapshot: IndexSnapshot = { active: false, completed: 0, phase: "idle", statuses: {}, total: 0 };
+  private snapshot: IndexSnapshot = { completed: 0, phase: "idle", statuses: {}, total: 0 };
 
   constructor(
     adapter: IndexAdapter,
@@ -453,16 +452,16 @@ export class MarkdownIndex {
 
   async start(model: EmbeddingModel): Promise<IndexSnapshot> {
     const revision = ++this.revision;
-    if (!validModel(model)) return this.update({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+    if (!validModel(model)) return this.update({ completed: 0, phase: "failed", statuses: {}, total: 0 });
     const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
-    this.update({ active: false, completed: 0, phase: "indexing", statuses: {}, total: sources.length });
+    this.update({ completed: 0, phase: "indexing", statuses: {}, total: sources.length });
     try {
       const restored = await this.restore(model, sources, revision);
       if (restored) return restored;
       return await this.build(model, sources, revision);
     } catch {
       if (revision !== this.revision) return this.getSnapshot();
-      return this.update({ active: false, completed: 0, phase: "failed", statuses: {}, total: sources.length });
+      return this.update({ completed: 0, phase: "failed", statuses: {}, total: sources.length });
     }
   }
 
@@ -518,7 +517,8 @@ export class MarkdownIndex {
           expected,
           catalog.signature.vectorDimension,
         );
-        if (!record || record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
+        if (!record || record.chunks.length !== prepared.chunks.length ||
+          record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
         for (let ordinal = 0; ordinal < prepared.chunks.length; ordinal += 1) {
           const stored = record.chunks[ordinal];
           const current = prepared.chunks[ordinal];
@@ -528,7 +528,6 @@ export class MarkdownIndex {
       }
     }
     return this.update({
-      active: true,
       completed: sources.length,
       phase: "ready",
       statuses: statusCounts(catalog.entries),
@@ -589,7 +588,6 @@ export class MarkdownIndex {
         }
         entries.push(entry);
         this.update({
-          active: false,
           completed: entries.length,
           latestPath: source.path,
           phase: "indexing",
@@ -623,7 +621,6 @@ export class MarkdownIndex {
       if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
       await this.adapter.process(activePath, () => JSON.stringify({ generationId }));
       const ready = this.update({
-        active: true,
         completed: sources.length,
         phase: "ready",
         statuses: statusCounts(entries),

@@ -125,8 +125,13 @@ test("a completed generation is restored without embedding unchanged Markdown", 
 
   const recordPath = [...adapter.files.keys()].find((path) => path.includes("/records/"));
   const record = JSON.parse(await adapter.read(recordPath));
-  record.chunks[0].locator.start += 1;
+  record.chunks.push({ ...record.chunks[0], id: "forged-extra-chunk" });
   await adapter.write(recordPath, JSON.stringify(record));
+  const catalogPath = [...adapter.files.keys()].find((path) => path.endsWith("/catalog.json"));
+  const catalog = JSON.parse(await adapter.read(catalogPath));
+  catalog.entries[0].chunkCount += 1;
+  catalog.entries[0].vectorCount += 1;
+  await adapter.write(catalogPath, JSON.stringify(catalog));
   const corrupted = new MarkdownIndex(adapter, "plugin/index-v1", () => sources, embed);
   assert.equal((await corrupted.start(model)).phase, "ready");
   assert.ok(embedCalls > callsAfterBuild);
