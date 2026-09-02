@@ -1,6 +1,11 @@
 import { ItemView, Plugin, WorkspaceLeaf } from "obsidian";
 
 import {
+  type IndexSnapshot,
+  MarkdownIndex,
+  type MarkdownSource,
+} from "./indexing";
+import {
   type LLMvaultSettings,
   type OllamaDiscovery,
   OllamaClient,
@@ -37,10 +42,14 @@ const RECOVERY_MESSAGES: Record<OllamaErrorCode, string> = {
 };
 
 class VaultChatView extends ItemView {
+  private askButton?: HTMLButtonElement;
   private busy = false;
   private chatModel: string | null;
   private discovery: OllamaDiscovery | null = null;
   private embeddingModel: string | null;
+  private indexEl?: HTMLElement;
+  private indexUnsubscribe?: () => void;
+  private questionEl?: HTMLTextAreaElement;
   private requestGeneration = 0;
   private portValue: string;
   private setupEl?: HTMLElement;
@@ -71,6 +80,7 @@ class VaultChatView extends ItemView {
 
   override onOpen(): Promise<void> {
     this.renderShell();
+    this.indexUnsubscribe = this.plugin.subscribeIndex(() => this.renderIndex());
     void this.refreshModels();
     return Promise.resolve();
   }
@@ -78,6 +88,7 @@ class VaultChatView extends ItemView {
   override onClose(): Promise<void> {
     this.requestGeneration += 1;
     this.plugin.abortOllamaRequests();
+    this.indexUnsubscribe?.();
     this.contentEl.empty();
     return Promise.resolve();
   }
@@ -96,6 +107,9 @@ class VaultChatView extends ItemView {
 
     this.setupEl = root.createDiv({ cls: "llmvault-chat__setup" });
     this.renderSetup();
+
+    this.indexEl = root.createEl("section", { cls: "llmvault-chat__index" });
+    this.renderIndex();
 
     const answer = root.createEl("section", {
       cls: "llmvault-chat__answer",
@@ -131,19 +145,52 @@ class VaultChatView extends ItemView {
       attr: { for: "llmvault-question" },
       text: "Ask a question about your vault",
     });
-    composer.createEl("textarea", {
+    composer.onsubmit = (event) => event.preventDefault();
+    this.questionEl = composer.createEl("textarea", {
       attr: {
         "aria-describedby": "llmvault-setup-status",
-        disabled: "",
         id: "llmvault-question",
         placeholder: "Ask about your vault…",
         rows: "3",
       },
     });
-    composer.createEl("button", {
-      attr: { disabled: "", type: "submit" },
+    this.askButton = composer.createEl("button", {
+      attr: { type: "submit" },
       text: "Ask",
     });
+    this.renderIndex();
+  }
+
+  private renderIndex(): void {
+    const snapshot = this.plugin.getIndexSnapshot();
+    const index = this.indexEl;
+    if (index) {
+      index.empty();
+      index.createEl("h3", { text: "Vault index" });
+      index.createEl("p", {
+        attr: { "aria-live": "polite", role: "status" },
+        text: this.indexMessage(snapshot),
+      });
+    }
+    if (this.questionEl) this.questionEl.disabled = !snapshot.active;
+    if (this.askButton) this.askButton.disabled = !snapshot.active;
+  }
+
+  private indexMessage(snapshot: IndexSnapshot): string {
+    const outcomes = Object.entries(snapshot.statuses)
+      .map(([status, count]) => `${String(count)} ${status.replaceAll("_", " ")}`)
+      .join(", ");
+    if (snapshot.phase === "ready") {
+      return `Index ready: ${outcomes || "no Markdown files"}.`;
+    }
+    if (snapshot.phase === "indexing") {
+      const current = snapshot.latestPath ? ` Current source: ${snapshot.latestPath}.` : "";
+      return `Indexing ${snapshot.completed} of ${snapshot.total} Markdown files${outcomes ? ` (${outcomes})` : ""}.${current}`;
+    }
+    if (snapshot.phase === "failed") {
+      return "Indexing failed. Verify the selected embedding model and retry setup.";
+    }
+    return "Indexing waits for compatible Local Model setup.";
   }
 
   private renderSetup(): void {
@@ -382,8 +429,8 @@ class VaultChatView extends ItemView {
       }
 
       await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel });
-      this.status =
-        "Setup complete. Both Local Models are compatible; indexing has not started.";
+      this.status = "Setup complete. Both Local Models are compatible; indexing is starting.";
+      void this.plugin.startIndexing(this.discovery, embeddingModel);
     } catch (error) {
       if (requestGeneration !== this.requestGeneration) return;
       this.status = this.errorMessage(error);
@@ -430,11 +477,35 @@ class VaultChatView extends ItemView {
 }
 
 export default class LLMvaultPlugin extends Plugin {
+  private index?: MarkdownIndex;
+  private indexSnapshot: IndexSnapshot = {
+    active: false,
+    completed: 0,
+    phase: "idle",
+    statuses: {},
+    total: 0,
+  };
+  private readonly indexSubscribers = new Set<(snapshot: IndexSnapshot) => void>();
+  private readonly indexOllama = new OllamaClient();
   private readonly ollama = new OllamaClient();
   private llmvaultSettings = normalizeSettings(null);
 
   override async onload(): Promise<void> {
     this.llmvaultSettings = normalizeSettings(await this.loadData());
+    const pluginDirectory = this.manifest.dir;
+    if (pluginDirectory) {
+      this.index = new MarkdownIndex(
+        this.app.vault.adapter,
+        `${pluginDirectory}/index-v1`,
+        () => this.markdownSources(),
+        (inputs) => {
+          const settings = this.getSettings();
+          if (!settings.embeddingModel) return Promise.reject(new Error("embedding_model_unavailable"));
+          return this.indexOllama.embed(settings.ollamaPort, settings.embeddingModel, inputs);
+        },
+        (snapshot) => this.reportIndex(snapshot),
+      );
+    }
     this.registerView(
       VIEW_TYPE_VAULT_CHAT,
       (leaf) => new VaultChatView(leaf, this),
@@ -449,9 +520,13 @@ export default class LLMvaultPlugin extends Plugin {
     this.addRibbonIcon("message-circle", "Open Vault Chat", () => {
       void this.openVaultChat();
     });
+
+    this.app.workspace.onLayoutReady(() => void this.restoreIndex());
   }
 
   override onunload(): void {
+    this.index?.cancel();
+    this.indexOllama.abortAll();
     this.ollama.abortAll();
     void this.app.workspace.detachLeavesOfType(VIEW_TYPE_VAULT_CHAT);
   }
@@ -479,6 +554,57 @@ export default class LLMvaultPlugin extends Plugin {
 
   abortOllamaRequests(): void {
     this.ollama.abortAll();
+  }
+
+  getIndexSnapshot(): IndexSnapshot {
+    return { ...this.indexSnapshot, statuses: { ...this.indexSnapshot.statuses } };
+  }
+
+  subscribeIndex(subscriber: (snapshot: IndexSnapshot) => void): () => void {
+    this.indexSubscribers.add(subscriber);
+    subscriber(this.getIndexSnapshot());
+    return () => this.indexSubscribers.delete(subscriber);
+  }
+
+  async startIndexing(discovery: OllamaDiscovery, embeddingModel: string): Promise<void> {
+    const digest = discovery.modelDigests[embeddingModel];
+    if (!this.index || !digest) {
+      this.reportIndex({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+      return;
+    }
+    this.indexOllama.abortAll();
+    this.index.cancel();
+    await this.index.start({ digest, name: embeddingModel });
+  }
+
+  private markdownSources(): MarkdownSource[] {
+    const configurationRoot = `${this.app.vault.configDir}/`;
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => file.path !== this.app.vault.configDir && !file.path.startsWith(configurationRoot))
+      .map((file) => ({
+        path: file.path,
+        read: () => this.app.vault.cachedRead(file),
+        size: file.stat.size,
+      }));
+  }
+
+  private reportIndex(snapshot: IndexSnapshot): void {
+    this.indexSnapshot = snapshot;
+    for (const subscriber of this.indexSubscribers) subscriber(this.getIndexSnapshot());
+  }
+
+  private async restoreIndex(): Promise<void> {
+    const settings = this.getSettings();
+    if (!settings.embeddingModel) return;
+    try {
+      const discovery = await this.discoverModels(settings.ollamaPort);
+      if (discovery.embeddingModels.includes(settings.embeddingModel)) {
+        await this.startIndexing(discovery, settings.embeddingModel);
+      }
+    } catch {
+      this.reportIndex({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+    }
   }
 
   private async openVaultChat(): Promise<void> {

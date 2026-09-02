@@ -1,10 +1,12 @@
 const DEFAULT_OLLAMA_PORT = 11434;
+const EMBEDDING_TIMEOUT_MS = 5 * 60_000;
+const MAX_EMBEDDING_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 1_000;
 const MAX_MODEL_ID_LENGTH = 512;
 const METADATA_TIMEOUT_MS = 10_000;
 
-type OllamaRoute = "/api/version" | "/api/tags" | "/api/show";
+type OllamaRoute = "/api/version" | "/api/tags" | "/api/show" | "/api/embed";
 type ModelCapability = "completion" | "embedding";
 type Fetcher = (
   input: RequestInfo | URL,
@@ -37,6 +39,7 @@ export interface OllamaDiscovery {
   installedModelCount: number;
   chatModels: string[];
   embeddingModels: string[];
+  modelDigests: Record<string, string>;
   remoteModels: string[];
 }
 
@@ -72,6 +75,10 @@ function isModelId(value: unknown): value is string {
   );
 }
 
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+
 function isRemote(value: Record<string, unknown>): boolean {
   return [value.remote_host, value.remote_model].some(
     (field) =>
@@ -96,9 +103,10 @@ function errorForStatus(route: OllamaRoute, status: number): OllamaError {
 async function readBoundedJson(
   response: Response,
   route: OllamaRoute,
+  maximumBytes = MAX_METADATA_BYTES,
 ): Promise<unknown> {
   const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_METADATA_BYTES) {
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
     throw new OllamaError("invalid_response", route, response.status);
   }
 
@@ -117,7 +125,7 @@ async function readBoundedJson(
         break;
       }
       bytes += value.byteLength;
-      if (bytes > MAX_METADATA_BYTES) {
+      if (bytes > maximumBytes) {
         throw new OllamaError("invalid_response", route, response.status);
       }
       try {
@@ -233,17 +241,26 @@ export class OllamaClient {
       throw new OllamaError("ollama_incompatible", "/api/tags");
     }
 
-    const catalog = new Map<string, boolean>();
+    const catalog = new Map<string, { digest?: string; remote: boolean }>();
     for (const model of tagsValue.models) {
       if (!isRecord(model) || !isModelId(model.model)) continue;
-      catalog.set(model.model, (catalog.get(model.model) ?? false) || isRemote(model));
+      const previous = catalog.get(model.model);
+      catalog.set(model.model, {
+        ...(isDigest(model.digest)
+          ? { digest: model.digest }
+          : previous?.digest
+            ? { digest: previous.digest }
+            : {}),
+        remote: (previous?.remote ?? false) || isRemote(model),
+      });
     }
 
     const chatModels: string[] = [];
     const embeddingModels: string[] = [];
+    const modelDigests: Record<string, string> = {};
     const remoteModels: string[] = [];
-    for (const [model, remote] of catalog) {
-      if (remote) {
+    for (const [model, metadata] of catalog) {
+      if (metadata.remote) {
         remoteModels.push(model);
         continue;
       }
@@ -251,6 +268,7 @@ export class OllamaClient {
       if (details === "remote") {
         remoteModels.push(model);
       } else if (details) {
+        if (metadata.digest) modelDigests[model] = metadata.digest;
         if (details.has("completion")) chatModels.push(model);
         if (details.has("embedding")) embeddingModels.push(model);
       }
@@ -261,8 +279,37 @@ export class OllamaClient {
       installedModelCount: catalog.size,
       chatModels: chatModels.sort(),
       embeddingModels: embeddingModels.sort(),
+      modelDigests,
       remoteModels: remoteModels.sort(),
     };
+  }
+
+  async embed(port: number, model: string, inputs: string[]): Promise<number[][]> {
+    if (!isModelId(model) || inputs.length === 0 || inputs.some((input) => typeof input !== "string" || input.length === 0)) {
+      throw new OllamaError("invalid_request", "/api/embed");
+    }
+    const value = await this.request(
+      port,
+      "/api/embed",
+      "POST",
+      { input: inputs, model, truncate: false },
+      EMBEDDING_TIMEOUT_MS,
+      MAX_EMBEDDING_RESPONSE_BYTES,
+    );
+    if (!isRecord(value) || !Array.isArray(value.embeddings) || value.embeddings.length !== inputs.length) {
+      throw new OllamaError("invalid_response", "/api/embed");
+    }
+    let dimension = 0;
+    const vectors: number[][] = [];
+    for (const vector of value.embeddings) {
+      if (!Array.isArray(vector) || vector.length === 0 || vector.some((item) => typeof item !== "number" || !Number.isFinite(item))) {
+        throw new OllamaError("invalid_response", "/api/embed");
+      }
+      dimension ||= vector.length;
+      if (vector.length !== dimension) throw new OllamaError("invalid_response", "/api/embed");
+      vectors.push(vector as number[]);
+    }
+    return vectors;
   }
 
   async validateModel(
@@ -307,7 +354,9 @@ export class OllamaClient {
     port: number,
     route: OllamaRoute,
     method: "GET" | "POST",
-    body?: Record<string, string>,
+    body?: Record<string, unknown>,
+    timeoutMs = METADATA_TIMEOUT_MS,
+    maximumBytes = MAX_METADATA_BYTES,
   ): Promise<unknown> {
     const url = `${ollamaOrigin(port)}${route}`;
     const controller = new AbortController();
@@ -316,7 +365,7 @@ export class OllamaClient {
     const timeout = globalThis.setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, METADATA_TIMEOUT_MS);
+    }, timeoutMs);
 
     try {
       const response = await this.fetcher(url, {
@@ -336,7 +385,7 @@ export class OllamaClient {
         await response.body?.cancel().catch(() => undefined);
         throw errorForStatus(route, response.status);
       }
-      return await readBoundedJson(response, route);
+      return await readBoundedJson(response, route, maximumBytes);
     } catch (error) {
       if (error instanceof OllamaError) throw error;
       if (timedOut) throw new OllamaError("timeout", route);

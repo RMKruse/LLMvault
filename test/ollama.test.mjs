@@ -33,9 +33,9 @@ test("discovery exposes only compatible local models through the fixed API", asy
     if (url.pathname === "/api/tags") {
       return json({
         models: [
-          ...Object.keys(details).map((model) => ({ model })),
-          { model: "remote", remote_model: "cloud/model" },
-          { model: "remote-whitespace", remote_host: " " },
+          ...Object.keys(details).map((model) => ({ model, digest: `sha256:${model}` })),
+          { model: "remote", digest: "sha256:remote", remote_model: "cloud/model" },
+          { model: "remote-whitespace", digest: "sha256:remote-whitespace", remote_host: " " },
         ],
       });
     }
@@ -52,6 +52,12 @@ test("discovery exposes only compatible local models through the fixed API", asy
     "remote-in-show",
     "remote-whitespace",
   ]);
+  assert.deepEqual(discovery.modelDigests, {
+    both: "sha256:both",
+    chat: "sha256:chat",
+    embed: "sha256:embed",
+    incompatible: "sha256:incompatible",
+  });
   assert.equal(discovery.version, "0.11.0");
   assert.equal(discovery.installedModelCount, 7);
   assert.deepEqual(
@@ -171,5 +177,39 @@ test("owned requests can be canceled with a stable non-failure code", async () =
   await assert.rejects(
     discovery,
     (error) => error instanceof OllamaError && error.code === "canceled",
+  );
+});
+
+test("embedding batches preserve order, disable truncation, and validate every vector", async () => {
+  const client = new OllamaClient(async (input, init) => {
+    const url = new URL(input);
+    assert.equal(url.pathname, "/api/embed");
+    assert.deepEqual(JSON.parse(init.body), {
+      model: "embed",
+      input: ["first", "second"],
+      truncate: false,
+    });
+    return json({ embeddings: [[1, 2], [3, 4]] });
+  });
+
+  assert.deepEqual(await client.embed(11434, "embed", ["first", "second"]), [
+    [1, 2],
+    [3, 4],
+  ]);
+
+  for (const embeddings of [[], [[]], [[Number.NaN]]]) {
+    const invalid = new OllamaClient(async () => json({ embeddings }));
+    await assert.rejects(
+      invalid.embed(11434, "embed", ["first"]),
+      (error) => error instanceof OllamaError && error.code === "invalid_response",
+    );
+  }
+
+  const inconsistent = new OllamaClient(async () =>
+    json({ embeddings: [[1], [2, 3]] }),
+  );
+  await assert.rejects(
+    inconsistent.embed(11434, "embed", ["first", "second"]),
+    (error) => error instanceof OllamaError && error.code === "invalid_response",
   );
 });

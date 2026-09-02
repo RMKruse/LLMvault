@@ -1,0 +1,658 @@
+export const CHUNK_TARGET_BYTES = 2_048;
+export const CHUNK_OVERLAP_BYTES = 512;
+
+const RAW_SOURCE_LIMIT_BYTES = 10 * 1024 * 1024;
+const EXTRACTED_TEXT_LIMIT_BYTES = 5 * 1024 * 1024;
+const SOURCE_WORK_LIMIT_MS = 5_000;
+const EMBEDDING_BATCH_SIZE = 16;
+const SCHEMA_VERSION = 1;
+const EXTRACTOR_VERSION = 1;
+const CHUNKER_VERSION = 1;
+
+type TerminalStatus =
+  | "indexed"
+  | "no_extractable_text"
+  | "limit_exceeded"
+  | "extractor_failed";
+
+type Anchor = { type: "heading" | "block"; value: string };
+
+export interface MarkdownChunk {
+  anchor?: Anchor;
+  end: number;
+  endLine: number;
+  start: number;
+  startLine: number;
+  text: string;
+}
+
+export interface MarkdownSource {
+  path: string;
+  read(): Promise<string>;
+  size: number;
+}
+
+export interface EmbeddingModel {
+  digest: string;
+  name: string;
+}
+
+export interface IndexSnapshot {
+  active: boolean;
+  completed: number;
+  latestPath?: string;
+  phase: "idle" | "indexing" | "ready" | "failed";
+  statuses: Partial<Record<TerminalStatus, number>>;
+  total: number;
+}
+
+interface IndexAdapter {
+  exists(path: string): Promise<boolean>;
+  mkdir(path: string): Promise<void>;
+  process(path: string, update: (value: string) => string): Promise<string>;
+  read(path: string): Promise<string>;
+  rmdir(path: string, recursive: boolean): Promise<void>;
+  write(path: string, value: string): Promise<void>;
+}
+
+interface SourceEntry {
+  chunkCount?: number;
+  fingerprint: string | null;
+  path: string;
+  reason?: "raw_source_too_large" | "extracted_text_too_large" | "source_work_timeout" | "read_failed";
+  record?: string;
+  sourceKey: string;
+  status: TerminalStatus;
+  vectorCount?: number;
+}
+
+interface Signature {
+  chunkOverlapBytes: number;
+  chunkTargetBytes: number;
+  chunkerVersion: number;
+  embeddingModelDigest: string;
+  embeddingModelName: string;
+  extractorVersion: number;
+  schemaVersion: number;
+  vectorDimension: number;
+}
+
+interface Catalog {
+  complete: true;
+  entries: SourceEntry[];
+  generationId: string;
+  signature: Signature;
+}
+
+interface StoredChunk {
+  id: string;
+  locator: Omit<MarkdownChunk, "text">;
+  vector: string;
+}
+
+interface SourceRecord {
+  chunks: StoredChunk[];
+  fingerprint: string;
+  sourceKey: string;
+  vectorDimension: number;
+}
+
+interface PreparedSource {
+  chunks: MarkdownChunk[];
+  entry: SourceEntry;
+}
+
+interface Piece {
+  bytes: number;
+  completeBlock: boolean;
+  end: number;
+  start: number;
+}
+
+const encoder = new TextEncoder();
+
+function byteLength(value: string): number {
+  return encoder.encode(value).byteLength;
+}
+
+function lineAt(source: string, offset: number): number {
+  let line = 1;
+  for (let index = 0; index < offset; index += 1) {
+    if (source.charCodeAt(index) === 10) line += 1;
+  }
+  return line;
+}
+
+function anchors(source: string): Array<Anchor & { offset: number }> {
+  const found: Array<Anchor & { offset: number }> = [];
+  for (const match of source.matchAll(/^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/gm)) {
+    found.push({ offset: match.index, type: "heading", value: match[2] ?? "" });
+  }
+  for (const match of source.matchAll(/\^([A-Za-z0-9-]+)[ \t]*$/gm)) {
+    found.push({ offset: match.index, type: "block", value: match[1] ?? "" });
+  }
+  return found.sort((left, right) => left.offset - right.offset);
+}
+
+function sourceBlocks(source: string): Piece[] {
+  const blocks: Piece[] = [];
+  let blockStart = 0;
+  let offset = 0;
+  for (const line of source.matchAll(/.*(?:\n|$)/g)) {
+    const value = line[0];
+    if (value.length === 0) continue;
+    const heading = /^#{1,6}[ \t]+/.test(value);
+    if (heading && offset > blockStart) {
+      blocks.push({
+        bytes: byteLength(source.slice(blockStart, offset)),
+        completeBlock: true,
+        end: offset,
+        start: blockStart,
+      });
+      blockStart = offset;
+    }
+    offset += value.length;
+    if (/^[ \t]*(?:\r?\n)$/.test(value)) {
+      blocks.push({
+        bytes: byteLength(source.slice(blockStart, offset)),
+        completeBlock: true,
+        end: offset,
+        start: blockStart,
+      });
+      blockStart = offset;
+    }
+  }
+  if (blockStart < source.length) {
+    blocks.push({
+      bytes: byteLength(source.slice(blockStart)),
+      completeBlock: true,
+      end: source.length,
+      start: blockStart,
+    });
+  }
+  return blocks.flatMap((block) => splitOversizedPiece(source, block));
+}
+
+function splitOversizedPiece(source: string, piece: Piece): Piece[] {
+  if (piece.bytes <= CHUNK_TARGET_BYTES) return [piece];
+  const split: Piece[] = [];
+  let packedStart = piece.start;
+  let packedEnd = piece.start;
+  let packedBytes = 0;
+  for (const line of source.slice(piece.start, piece.end).matchAll(/.*(?:\n|$)/g)) {
+    if (line[0].length === 0) continue;
+    const lineStart = piece.start + line.index;
+    const lineEnd = lineStart + line[0].length;
+    const lineBytes = byteLength(line[0]);
+    if (lineBytes > CHUNK_TARGET_BYTES) {
+      if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+      let start = lineStart;
+      let end = start;
+      let bytes = 0;
+      for (const character of line[0]) {
+        const characterBytes = byteLength(character);
+        if (bytes + characterBytes > CHUNK_TARGET_BYTES) {
+          split.push({ bytes, completeBlock: false, end, start });
+          start = end;
+          bytes = 0;
+        }
+        bytes += characterBytes;
+        end += character.length;
+      }
+      if (start < lineEnd) split.push({ bytes, completeBlock: false, end: lineEnd, start });
+      packedStart = lineEnd;
+      packedEnd = lineEnd;
+      packedBytes = 0;
+      continue;
+    }
+    if (packedBytes > 0 && packedBytes + lineBytes > CHUNK_TARGET_BYTES) {
+      split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+      packedStart = lineStart;
+      packedBytes = 0;
+    }
+    packedBytes += lineBytes;
+    packedEnd = lineEnd;
+  }
+  if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+  return split;
+}
+
+export function chunkMarkdown(source: string): MarkdownChunk[] {
+  if (source.length === 0) return [];
+  const pieces = sourceBlocks(source);
+  const sourceAnchors = anchors(source);
+  const chunks: MarkdownChunk[] = [];
+  let cursor = 0;
+
+  while (cursor < pieces.length) {
+    const first = cursor;
+    let bytes = 0;
+    while (
+      cursor < pieces.length &&
+      bytes + (pieces[cursor]?.bytes ?? 0) <= CHUNK_TARGET_BYTES
+    ) {
+      bytes += pieces[cursor]?.bytes ?? 0;
+      cursor += 1;
+    }
+    const start = pieces[first]?.start;
+    const end = pieces[cursor - 1]?.end;
+    if (start === undefined || end === undefined) break;
+    let nearest = sourceAnchors.find((anchor) => anchor.offset < end);
+    for (const anchor of sourceAnchors) {
+      if (anchor.offset > start) break;
+      nearest = anchor;
+    }
+    chunks.push({
+      ...(nearest ? { anchor: { type: nearest.type, value: nearest.value } } : {}),
+      end,
+      endLine: lineAt(source, Math.max(start, end - 1)),
+      start,
+      startLine: lineAt(source, start),
+      text: source.slice(start, end),
+    });
+
+    const overlap = pieces[cursor - 1];
+    const next = pieces[cursor];
+    if (
+      overlap &&
+      next &&
+      cursor - 1 > first &&
+      overlap.completeBlock &&
+      overlap.bytes <= CHUNK_OVERLAP_BYTES &&
+      overlap.bytes + next.bytes <= CHUNK_TARGET_BYTES
+    ) {
+      cursor -= 1;
+    }
+  }
+  return chunks;
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+export function encodeVector(vector: readonly number[]): string {
+  if (vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
+    throw new TypeError("invalid_embedding_vector");
+  }
+  const bytes = new Uint8Array(vector.length * Float32Array.BYTES_PER_ELEMENT);
+  const view = new DataView(bytes.buffer);
+  vector.forEach((value, index) => view.setFloat32(index * 4, value, true));
+  return bytesToBase64(bytes);
+}
+
+function validEncodedVector(value: unknown, dimension: number): boolean {
+  if (typeof value !== "string" || dimension <= 0) return false;
+  try {
+    const binary = atob(value);
+    if (binary.length !== dimension * 4) return false;
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const view = new DataView(bytes.buffer);
+    for (let index = 0; index < dimension; index += 1) {
+      if (!Number.isFinite(view.getFloat32(index * 4, true))) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isGenerationId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validModel(model: EmbeddingModel): boolean {
+  return model.name.length > 0 && model.name.length <= 512 && model.digest.length > 0 && model.digest.length <= 512;
+}
+
+function signatureFor(model: EmbeddingModel, vectorDimension: number): Signature {
+  return {
+    chunkOverlapBytes: CHUNK_OVERLAP_BYTES,
+    chunkTargetBytes: CHUNK_TARGET_BYTES,
+    chunkerVersion: CHUNKER_VERSION,
+    embeddingModelDigest: model.digest,
+    embeddingModelName: model.name,
+    extractorVersion: EXTRACTOR_VERSION,
+    schemaVersion: SCHEMA_VERSION,
+    vectorDimension,
+  };
+}
+
+function compatibleSignature(value: unknown, model: EmbeddingModel): value is Signature {
+  if (!isRecord(value)) return false;
+  const expected = signatureFor(model, Number(value.vectorDimension));
+  return Number.isInteger(value.vectorDimension) && Number(value.vectorDimension) >= 0 &&
+    Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
+}
+
+async function withDeadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("source_work_timeout")), SOURCE_WORK_LIMIT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function prepareSource(source: MarkdownSource): Promise<PreparedSource> {
+  const sourceKey = await sha256(source.path);
+  if (source.size > RAW_SOURCE_LIMIT_BYTES) {
+    return {
+      chunks: [],
+      entry: { fingerprint: null, path: source.path, reason: "raw_source_too_large", sourceKey, status: "limit_exceeded" },
+    };
+  }
+  try {
+    const started = performance.now();
+    const text = await withDeadline(source.read());
+    const fingerprint = await sha256(`md\0${text}`);
+    if (byteLength(text) > EXTRACTED_TEXT_LIMIT_BYTES) {
+      return {
+        chunks: [],
+        entry: { fingerprint, path: source.path, reason: "extracted_text_too_large", sourceKey, status: "limit_exceeded" },
+      };
+    }
+    if (text.trim().length === 0) {
+      return { chunks: [], entry: { fingerprint, path: source.path, sourceKey, status: "no_extractable_text" } };
+    }
+    const chunks = chunkMarkdown(text);
+    if (performance.now() - started > SOURCE_WORK_LIMIT_MS) {
+      return {
+        chunks: [],
+        entry: { fingerprint, path: source.path, reason: "source_work_timeout", sourceKey, status: "limit_exceeded" },
+      };
+    }
+    return { chunks, entry: { fingerprint, path: source.path, sourceKey, status: "indexed" } };
+  } catch (error) {
+    const timedOut = error instanceof Error && error.message === "source_work_timeout";
+    return {
+      chunks: [],
+      entry: {
+        fingerprint: null,
+        path: source.path,
+        reason: timedOut ? "source_work_timeout" : "read_failed",
+        sourceKey,
+        status: timedOut ? "limit_exceeded" : "extractor_failed",
+      },
+    };
+  }
+}
+
+function statusCounts(entries: SourceEntry[]): Partial<Record<TerminalStatus, number>> {
+  const counts: Partial<Record<TerminalStatus, number>> = {};
+  for (const entry of entries) counts[entry.status] = (counts[entry.status] ?? 0) + 1;
+  return counts;
+}
+
+function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed) || parsed.complete !== true || !isGenerationId(parsed.generationId) ||
+      !compatibleSignature(parsed.signature, model) || !Array.isArray(parsed.entries)) return null;
+    const entries: SourceEntry[] = [];
+    for (const item of parsed.entries) {
+      if (!isRecord(item) || typeof item.path !== "string" || typeof item.sourceKey !== "string" ||
+        !(typeof item.fingerprint === "string" || item.fingerprint === null) ||
+        !["indexed", "no_extractable_text", "limit_exceeded", "extractor_failed"].includes(String(item.status))) return null;
+      entries.push(item as unknown as SourceEntry);
+    }
+    return { complete: true, entries, generationId: parsed.generationId, signature: parsed.signature };
+  } catch {
+    return null;
+  }
+}
+
+function parseRecord(value: string, entry: SourceEntry, dimension: number): SourceRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed) || parsed.sourceKey !== entry.sourceKey || parsed.fingerprint !== entry.fingerprint ||
+      parsed.vectorDimension !== dimension || !Array.isArray(parsed.chunks) || parsed.chunks.length === 0) return null;
+    for (const chunk of parsed.chunks) {
+      if (!isRecord(chunk) || typeof chunk.id !== "string" || !isRecord(chunk.locator) ||
+        !validEncodedVector(chunk.vector, dimension)) return null;
+      const locator = chunk.locator;
+      if (![locator.start, locator.end, locator.startLine, locator.endLine].every(Number.isInteger)) return null;
+    }
+    return parsed as unknown as SourceRecord;
+  } catch {
+    return null;
+  }
+}
+
+export class MarkdownIndex {
+  private readonly adapter: IndexAdapter;
+  private readonly embed: (inputs: string[]) => Promise<number[][]>;
+  private readonly listSources: () => MarkdownSource[];
+  private readonly onProgress: (snapshot: IndexSnapshot) => void;
+  private revision = 0;
+  private readonly root: string;
+  private snapshot: IndexSnapshot = { active: false, completed: 0, phase: "idle", statuses: {}, total: 0 };
+
+  constructor(
+    adapter: IndexAdapter,
+    root: string,
+    listSources: () => MarkdownSource[],
+    embed: (inputs: string[]) => Promise<number[][]>,
+    onProgress: (snapshot: IndexSnapshot) => void = () => undefined,
+  ) {
+    this.adapter = adapter;
+    this.root = root;
+    this.listSources = listSources;
+    this.embed = embed;
+    this.onProgress = onProgress;
+  }
+
+  cancel(): void {
+    this.revision += 1;
+  }
+
+  getSnapshot(): IndexSnapshot {
+    return { ...this.snapshot, statuses: { ...this.snapshot.statuses } };
+  }
+
+  async start(model: EmbeddingModel): Promise<IndexSnapshot> {
+    const revision = ++this.revision;
+    if (!validModel(model)) return this.update({ active: false, completed: 0, phase: "failed", statuses: {}, total: 0 });
+    const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
+    this.update({ active: false, completed: 0, phase: "indexing", statuses: {}, total: sources.length });
+    try {
+      const restored = await this.restore(model, sources, revision);
+      if (restored) return restored;
+      return await this.build(model, sources, revision);
+    } catch {
+      if (revision !== this.revision) return this.getSnapshot();
+      return this.update({ active: false, completed: 0, phase: "failed", statuses: {}, total: sources.length });
+    }
+  }
+
+  private update(snapshot: IndexSnapshot): IndexSnapshot {
+    this.snapshot = snapshot;
+    this.onProgress(this.getSnapshot());
+    return this.getSnapshot();
+  }
+
+  private assertCurrent(revision: number): void {
+    if (revision !== this.revision) throw new Error("canceled");
+  }
+
+  private async ensureDirectories(generationId: string): Promise<string> {
+    const generations = `${this.root}/generations`;
+    const generation = `${generations}/${generationId}`;
+    for (const path of [this.root, generations, generation, `${generation}/records`]) {
+      if (!(await this.adapter.exists(path))) await this.adapter.mkdir(path);
+    }
+    return generation;
+  }
+
+  private async restore(
+    model: EmbeddingModel,
+    sources: MarkdownSource[],
+    revision: number,
+  ): Promise<IndexSnapshot | null> {
+    const activePath = `${this.root}/active.json`;
+    if (!(await this.adapter.exists(activePath))) return null;
+    let active: unknown;
+    try {
+      active = JSON.parse(await this.adapter.read(activePath));
+    } catch {
+      return null;
+    }
+    if (!isRecord(active) || !isGenerationId(active.generationId)) return null;
+    const generation = `${this.root}/generations/${active.generationId}`;
+    const catalog = parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model);
+    if (!catalog || catalog.generationId !== active.generationId || catalog.entries.length !== sources.length) return null;
+    const entriesByPath = new Map(catalog.entries.map((entry) => [entry.path, entry]));
+    for (const source of sources) {
+      this.assertCurrent(revision);
+      const expected = entriesByPath.get(source.path);
+      if (!expected) return null;
+      const prepared = await prepareSource(source);
+      if (prepared.entry.fingerprint !== expected.fingerprint || prepared.entry.status !== expected.status ||
+        prepared.entry.sourceKey !== expected.sourceKey) return null;
+      if (expected.status === "indexed") {
+        const recordName = `records/${expected.sourceKey}-${expected.fingerprint}.json`;
+        if (expected.record !== recordName || !(await this.adapter.exists(`${generation}/${recordName}`))) return null;
+        const record = parseRecord(
+          await this.adapter.read(`${generation}/${recordName}`),
+          expected,
+          catalog.signature.vectorDimension,
+        );
+        if (!record || record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
+      }
+    }
+    return this.update({
+      active: true,
+      completed: sources.length,
+      phase: "ready",
+      statuses: statusCounts(catalog.entries),
+      total: sources.length,
+    });
+  }
+
+  private async build(
+    model: EmbeddingModel,
+    sources: MarkdownSource[],
+    revision: number,
+  ): Promise<IndexSnapshot> {
+    const generationId = globalThis.crypto.randomUUID();
+    const generation = await this.ensureDirectories(generationId);
+    const entries: SourceEntry[] = [];
+    let vectorDimension = 0;
+    try {
+      for (const source of sources) {
+        this.assertCurrent(revision);
+        const prepared = await prepareSource(source);
+        const entry = prepared.entry;
+        if (entry.status === "indexed") {
+          const storedChunks: StoredChunk[] = [];
+          for (let offset = 0; offset < prepared.chunks.length; offset += EMBEDDING_BATCH_SIZE) {
+            const batch = prepared.chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+            const vectors = await this.embed(batch.map((chunk) => chunk.text));
+            this.assertCurrent(revision);
+            if (vectors.length !== batch.length) throw new TypeError("invalid_embedding_vector_count");
+            for (let index = 0; index < batch.length; index += 1) {
+              const chunk = batch[index];
+              const vector = vectors[index];
+              if (!chunk || !vector || vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
+                throw new TypeError("invalid_embedding_vector");
+              }
+              vectorDimension ||= vector.length;
+              if (vector.length !== vectorDimension) throw new TypeError("inconsistent_embedding_dimension");
+              const ordinal = offset + index;
+              storedChunks.push({
+                id: `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
+                locator: {
+                  ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
+                  end: chunk.end,
+                  endLine: chunk.endLine,
+                  start: chunk.start,
+                  startLine: chunk.startLine,
+                },
+                vector: encodeVector(vector),
+              });
+            }
+          }
+          const recordName = `records/${entry.sourceKey}-${entry.fingerprint}.json`;
+          const record: SourceRecord = {
+            chunks: storedChunks,
+            fingerprint: entry.fingerprint ?? "",
+            sourceKey: entry.sourceKey,
+            vectorDimension,
+          };
+          await this.adapter.write(`${generation}/${recordName}`, JSON.stringify(record));
+          const validated = parseRecord(await this.adapter.read(`${generation}/${recordName}`), entry, vectorDimension);
+          if (!validated) throw new TypeError("invalid_persisted_record");
+          entry.chunkCount = storedChunks.length;
+          entry.record = recordName;
+          entry.vectorCount = storedChunks.length;
+        }
+        entries.push(entry);
+        this.update({
+          active: false,
+          completed: entries.length,
+          latestPath: source.path,
+          phase: "indexing",
+          statuses: statusCounts(entries),
+          total: sources.length,
+        });
+      }
+
+      this.assertCurrent(revision);
+      const catalog: Catalog = {
+        complete: true,
+        entries,
+        generationId,
+        signature: signatureFor(model, vectorDimension),
+      };
+      await this.adapter.write(`${generation}/catalog.json`, JSON.stringify(catalog));
+      if (!parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model)) {
+        throw new TypeError("invalid_persisted_catalog");
+      }
+
+      const activePath = `${this.root}/active.json`;
+      let previousGeneration: string | undefined;
+      if (await this.adapter.exists(activePath)) {
+        try {
+          const previous: unknown = JSON.parse(await this.adapter.read(activePath));
+          if (isRecord(previous) && typeof previous.generationId === "string") previousGeneration = previous.generationId;
+        } catch {
+          previousGeneration = undefined;
+        }
+      }
+      if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
+      await this.adapter.process(activePath, () => JSON.stringify({ generationId }));
+      const ready = this.update({
+        active: true,
+        completed: sources.length,
+        phase: "ready",
+        statuses: statusCounts(entries),
+        total: sources.length,
+      });
+      if (previousGeneration && previousGeneration !== generationId) {
+        await this.adapter.rmdir(`${this.root}/generations/${previousGeneration}`, true).catch(() => undefined);
+      }
+      return ready;
+    } catch (error) {
+      await this.adapter.rmdir(generation, true).catch(() => undefined);
+      throw error;
+    }
+  }
+}

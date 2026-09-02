@@ -1,6 +1,6 @@
 .llmvault-chat {
   display: grid;
-  grid-template-rows: auto auto minmax(10rem, 1fr) auto auto;
+  grid-template-rows: auto auto auto minmax(10rem, 1fr) auto auto;
   gap: var(--size-4-3);
   height: 100%;
   padding: var(--size-4-3);
@@ -30,6 +30,7 @@
 }
 
 .llmvault-chat__setup,
+.llmvault-chat__index,
 .llmvault-chat__answer,
 .llmvault-chat__evidence {
   padding: var(--size-4-3);
@@ -42,6 +43,11 @@
   display: grid;
   gap: var(--size-4-2);
   border-color: var(--interactive-accent);
+}
+
+.llmvault-chat__index {
+  display: grid;
+  gap: var(--size-4-2);
 }
 
 .llmvault-chat__setup-form {
