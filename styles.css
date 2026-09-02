@@ -50,6 +50,12 @@
   gap: var(--size-4-2);
 }
 
+.llmvault-chat__outcomes {
+  max-height: 10rem;
+  margin: 0;
+  overflow: auto;
+}
+
 .llmvault-chat__setup-form {
   display: grid;
   gap: var(--size-4-2);

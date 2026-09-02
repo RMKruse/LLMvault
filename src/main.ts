@@ -3,9 +3,10 @@ import { ItemView, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import {
   type IndexSnapshot,
   type MarkdownAnchor,
-  MarkdownIndex,
-  type MarkdownSource,
+  VaultIndex,
+  type VaultSource,
   type RetrievedEvidence,
+  classifyVaultSource,
 } from "./indexing";
 import {
   type LLMvaultSettings,
@@ -193,6 +194,12 @@ class VaultChatView extends ItemView {
         attr: { "aria-live": "polite", role: "status" },
         text: this.indexMessage(snapshot),
       });
+      if (snapshot.phase === "ready" && snapshot.outcomes.length > 0) {
+        const files = index.createEl("ul", { cls: "llmvault-chat__outcomes" });
+        for (const outcome of snapshot.outcomes) {
+          files.createEl("li", { text: `${outcome.path}: ${this.outcomeMessage(outcome)}` });
+        }
+      }
     }
     this.renderComposerState(snapshot);
   }
@@ -202,16 +209,31 @@ class VaultChatView extends ItemView {
       .map(([status, count]) => `${String(count)} ${status.replaceAll("_", " ")}`)
       .join(", ");
     if (snapshot.phase === "ready") {
-      return `Index ready: ${outcomes || "no Markdown files"}.`;
+      return snapshot.total === 0
+        ? "Index ready: no Vault Content files."
+        : `Index ready: ${snapshot.total} Vault Content files (${outcomes}).`;
     }
     if (snapshot.phase === "indexing") {
       const current = snapshot.latestPath ? ` Current source: ${snapshot.latestPath}.` : "";
-      return `Indexing ${snapshot.completed} of ${snapshot.total} Markdown files${outcomes ? ` (${outcomes})` : ""}.${current}`;
+      return `Indexing ${snapshot.completed} of ${snapshot.total} Vault Content files${outcomes ? ` (${outcomes})` : ""}.${current}`;
     }
     if (snapshot.phase === "failed") {
       return "Indexing failed. Verify the selected embedding model and retry setup.";
     }
     return "Indexing waits for compatible Local Model setup.";
+  }
+
+  private outcomeMessage(outcome: IndexSnapshot["outcomes"][number]): string {
+    const reason = "reason" in outcome ? outcome.reason?.replaceAll("_", " ") : undefined;
+    if (outcome.status === "indexed") return "indexed";
+    if (outcome.status === "no_extractable_text") return `no extractable text (${reason}); add text, then rebuild`;
+    if (outcome.status === "ignored_non_content") return `ignored non-content (${reason})`;
+    if (outcome.status === "unsupported_format") return `unsupported format (${reason}); convert to Markdown or Canvas to index`;
+    if (outcome.status === "unrecognized_format") return `unrecognized format (${reason}); use a .md or .canvas extension to index`;
+    if (outcome.status === "limit_exceeded") {
+      return `${outcome.limit.replaceAll("_", " ")} ${String(outcome.observed)} exceeded ${String(outcome.ceiling)}; reduce the file and rebuild`;
+    }
+    return `extraction failed (${reason}); fix the source, then rebuild`;
   }
 
   private async askQuestion(): Promise<void> {
@@ -379,7 +401,7 @@ class VaultChatView extends ItemView {
         attr: { type: "button" },
       });
       card.createEl("strong", { text: `${item.citationId} · ${item.path}` });
-      card.createSpan({ text: `Lines ${item.startLine}–${item.endLine}` });
+      card.createSpan({ text: this.evidenceLocation(item) });
       card.onclick = () => void this.showEvidence(item.citationId);
     }
   }
@@ -395,7 +417,9 @@ class VaultChatView extends ItemView {
       preview.setText("This source changed or is unavailable. Rebuild the index and retry.");
       return;
     }
-    preview.createEl("strong", { text: `${current.path} · lines ${current.startLine}–${current.endLine}` });
+    preview.createEl("strong", {
+      text: `${current.path} · ${this.evidenceLocation(current).toLowerCase()}`,
+    });
     preview.createEl("pre", { text: current.text });
     const open = preview.createEl("button", {
       cls: "mod-cta",
@@ -407,6 +431,12 @@ class VaultChatView extends ItemView {
         preview.setText("This source changed or is unavailable. Rebuild the index and retry.");
       }
     };
+  }
+
+  private evidenceLocation(evidence: RetrievedEvidence): string {
+    return evidence.format === "canvas"
+      ? `Card “${evidence.excerpt ?? ""}”`
+      : `Lines ${String(evidence.startLine)}–${String(evidence.endLine)}`;
   }
 
   private renderInsufficient(message: string): void {
@@ -714,9 +744,10 @@ class VaultChatView extends ItemView {
 }
 
 export default class LLMvaultPlugin extends Plugin {
-  private index?: MarkdownIndex;
+  private index?: VaultIndex;
   private indexSnapshot: IndexSnapshot = {
     completed: 0,
+    outcomes: [],
     phase: "idle",
     statuses: {},
     total: 0,
@@ -731,10 +762,10 @@ export default class LLMvaultPlugin extends Plugin {
     this.llmvaultSettings = normalizeSettings(await this.loadData());
     const pluginDirectory = this.manifest.dir;
     if (pluginDirectory) {
-      this.index = new MarkdownIndex(
+      this.index = new VaultIndex(
         this.app.vault.adapter,
         `${pluginDirectory}/index-v1`,
-        () => this.markdownSources(),
+        () => this.vaultSources(),
         (inputs, model) => {
           const settings = this.getSettings();
           return this.indexOllama.embed(settings.ollamaPort, model.name, inputs);
@@ -880,15 +911,23 @@ export default class LLMvaultPlugin extends Plugin {
     const current = await this.resolveEvidence(evidence);
     if (!current) return false;
     const file = this.app.vault.getFileByPath(current.path);
-    if (!(file instanceof TFile) || file.extension !== "md") return false;
-    await this.app.workspace.getLeaf(false).openFile(file, {
-      eState: { line: current.startLine - 1 },
-    });
+    const expectedExtension = current.format === "markdown" ? "md" : "canvas";
+    if (!(file instanceof TFile) || file.extension.toLowerCase() !== expectedExtension) return false;
+    await this.app.workspace.getLeaf(false).openFile(
+      file,
+      current.format === "markdown" && current.startLine !== undefined
+        ? { eState: { line: current.startLine - 1 } }
+        : undefined,
+    );
     return true;
   }
 
   getIndexSnapshot(): IndexSnapshot {
-    return { ...this.indexSnapshot, statuses: { ...this.indexSnapshot.statuses } };
+    return {
+      ...this.indexSnapshot,
+      outcomes: this.indexSnapshot.outcomes.map((outcome) => ({ ...outcome })),
+      statuses: { ...this.indexSnapshot.statuses },
+    };
   }
 
   subscribeIndex(subscriber: (snapshot: IndexSnapshot) => void): () => void {
@@ -900,7 +939,7 @@ export default class LLMvaultPlugin extends Plugin {
   async startIndexing(discovery: OllamaDiscovery, embeddingModel: string): Promise<void> {
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
-      this.reportIndex({ completed: 0, phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
       return;
     }
     this.indexOllama.abortAll();
@@ -908,13 +947,15 @@ export default class LLMvaultPlugin extends Plugin {
     await this.index.start({ digest, name: embeddingModel });
   }
 
-  private markdownSources(): MarkdownSource[] {
+  private vaultSources(): VaultSource[] {
     const configurationRoot = `${this.app.vault.configDir}/`;
     return this.app.vault
-      .getMarkdownFiles()
+      .getFiles()
       .filter((file) => file.path !== this.app.vault.configDir && !file.path.startsWith(configurationRoot))
       .map((file) => {
-        const cache = this.app.metadataCache.getFileCache(file);
+        const cache = file.extension.toLowerCase() === "md"
+          ? this.app.metadataCache.getFileCache(file)
+          : null;
         const anchors: MarkdownAnchor[] = [
           ...(cache?.headings ?? []).map((heading) => ({
             offset: heading.position.start.offset,
@@ -927,11 +968,13 @@ export default class LLMvaultPlugin extends Plugin {
             value: block.id,
           })),
         ];
-        return {
+        return classifyVaultSource(
+          file.path,
+          file.extension,
+          file.stat.size,
+          () => this.app.vault.cachedRead(file),
           anchors,
-          path: file.path,
-          read: () => this.app.vault.cachedRead(file),
-        };
+        );
       });
   }
 
@@ -949,7 +992,7 @@ export default class LLMvaultPlugin extends Plugin {
         await this.startIndexing(discovery, settings.embeddingModel);
       }
     } catch {
-      this.reportIndex({ completed: 0, phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
     }
   }
 

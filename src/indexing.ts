@@ -1,5 +1,8 @@
 export const CHUNK_TARGET_BYTES = 2_048;
 export const CHUNK_OVERLAP_BYTES = 512;
+export const RAW_FILE_LIMIT_BYTES = 10 * 1024 * 1024;
+export const EXTRACTED_TEXT_LIMIT_BYTES = 5 * 1024 * 1024;
+export const PREPROCESSING_LIMIT_MS = 5_000;
 
 const EMBEDDING_BATCH_SIZE = 16;
 const SCHEMA_VERSION = 1;
@@ -9,7 +12,28 @@ const CHUNKER_VERSION = 1;
 type TerminalStatus =
   | "indexed"
   | "no_extractable_text"
+  | "ignored_non_content"
+  | "unsupported_format"
+  | "unrecognized_format"
+  | "limit_exceeded"
   | "extractor_failed";
+
+type VaultSourceKind = "markdown" | "canvas" |
+  "ignored_non_content" | "unsupported_format" | "unrecognized_format";
+
+type LimitName = "raw_bytes" | "extracted_text_bytes" | "preprocessing_ms";
+
+export type SourceOutcome = {
+  path: string;
+  reason?: string;
+  status: Exclude<TerminalStatus, "limit_exceeded">;
+} | {
+  ceiling: number;
+  limit: LimitName;
+  observed: number;
+  path: string;
+  status: "limit_exceeded";
+};
 
 export type MarkdownAnchor = {
   offset: number;
@@ -26,10 +50,21 @@ export interface MarkdownChunk {
   text: string;
 }
 
-export interface MarkdownSource {
+export interface CanvasChunk {
+  end: number;
+  excerpt: string;
+  nodeId: string;
+  start: number;
+  text: string;
+}
+
+export interface VaultSource {
   anchors?: MarkdownAnchor[];
+  kind?: VaultSourceKind;
   path: string;
-  read(): Promise<string>;
+  rawBytes?: number;
+  read?(): Promise<string>;
+  reason?: string;
 }
 
 export interface EmbeddingModel {
@@ -40,17 +75,26 @@ export interface EmbeddingModel {
 export interface IndexSnapshot {
   completed: number;
   latestPath?: string;
+  outcomes: SourceOutcome[];
   phase: "idle" | "indexing" | "ready" | "failed";
   statuses: Partial<Record<TerminalStatus, number>>;
   total: number;
 }
 
-export interface RetrievedEvidence extends Omit<MarkdownChunk, "text"> {
+export interface RetrievedEvidence {
+  anchor?: Omit<MarkdownAnchor, "offset">;
   citationId: string;
   chunkId: string;
+  end: number;
+  endLine?: number;
+  excerpt?: string;
   fingerprint: string;
+  format: "markdown" | "canvas";
+  nodeId?: string;
   path: string;
   score: number;
+  start: number;
+  startLine?: number;
   text: string;
 }
 
@@ -63,16 +107,13 @@ interface IndexAdapter {
   write(path: string, value: string): Promise<void>;
 }
 
-interface SourceEntry {
+type SourceEntry = SourceOutcome & {
   chunkCount?: number;
   fingerprint: string | null;
-  path: string;
-  reason?: "read_failed";
   record?: string;
   sourceKey: string;
-  status: TerminalStatus;
   vectorCount?: number;
-}
+};
 
 interface Signature {
   chunkOverlapBytes: number;
@@ -92,9 +133,17 @@ interface Catalog {
   signature: Signature;
 }
 
+type PreparedChunk =
+  | (MarkdownChunk & { format: "markdown" })
+  | (CanvasChunk & { format: "canvas" });
+
+type StoredLocator =
+  | (Omit<MarkdownChunk, "text"> & { format: "markdown"; path: string })
+  | (Omit<CanvasChunk, "text"> & { format: "canvas"; path: string });
+
 interface StoredChunk {
   id: string;
-  locator: Omit<MarkdownChunk, "text"> & { path: string };
+  locator: StoredLocator;
   vector: string;
 }
 
@@ -106,7 +155,7 @@ interface SourceRecord {
 }
 
 interface PreparedSource {
-  chunks: MarkdownChunk[];
+  chunks: PreparedChunk[];
   entry: SourceEntry;
 }
 
@@ -118,24 +167,35 @@ interface MarkdownPiece {
 }
 
 const encoder = new TextEncoder();
+const preprocessingLimitExceeded = Symbol("preprocessing_limit_exceeded");
+
+function assertWithinDeadline(deadline: number): void {
+  if (performance.now() > deadline) throw preprocessingLimitExceeded;
+}
 
 function byteLength(value: string): number {
   return encoder.encode(value).byteLength;
 }
 
-function lineAt(source: string, offset: number): number {
+function lineAt(source: string, offset: number, deadline = Number.POSITIVE_INFINITY): number {
   let line = 1;
   for (let index = 0; index < offset; index += 1) {
+    if (index % 4_096 === 0) assertWithinDeadline(deadline);
     if (source.charCodeAt(index) === 10) line += 1;
   }
   return line;
 }
 
-function sourceBlocks(source: string, headingOffsets: Set<number>): MarkdownPiece[] {
+function sourceBlocks(
+  source: string,
+  headingOffsets: Set<number>,
+  deadline = Number.POSITIVE_INFINITY,
+): MarkdownPiece[] {
   const blocks: MarkdownPiece[] = [];
   let blockStart = 0;
   let offset = 0;
   for (const line of source.matchAll(/.*(?:\n|$)/g)) {
+    assertWithinDeadline(deadline);
     const value = line[0];
     if (value.length === 0) continue;
     const heading = headingOffsets.has(offset);
@@ -167,16 +227,21 @@ function sourceBlocks(source: string, headingOffsets: Set<number>): MarkdownPiec
       start: blockStart,
     });
   }
-  return blocks.flatMap((block) => splitOversizedPiece(source, block));
+  return blocks.flatMap((block) => splitOversizedPiece(source, block, deadline));
 }
 
-function splitOversizedPiece(source: string, piece: MarkdownPiece): MarkdownPiece[] {
+function splitOversizedPiece(
+  source: string,
+  piece: MarkdownPiece,
+  deadline = Number.POSITIVE_INFINITY,
+): MarkdownPiece[] {
   if (piece.bytes <= CHUNK_TARGET_BYTES) return [piece];
   const split: MarkdownPiece[] = [];
   let packedStart = piece.start;
   let packedEnd = piece.start;
   let packedBytes = 0;
   for (const line of source.slice(piece.start, piece.end).matchAll(/.*(?:\n|$)/g)) {
+    assertWithinDeadline(deadline);
     if (line[0].length === 0) continue;
     const lineStart = piece.start + line.index;
     const lineEnd = lineStart + line[0].length;
@@ -186,7 +251,10 @@ function splitOversizedPiece(source: string, piece: MarkdownPiece): MarkdownPiec
       let start = lineStart;
       let end = start;
       let bytes = 0;
+      let characters = 0;
       for (const character of line[0]) {
+        if (characters % 4_096 === 0) assertWithinDeadline(deadline);
+        characters += 1;
         const characterBytes = byteLength(character);
         if (bytes + characterBytes > CHUNK_TARGET_BYTES) {
           split.push({ bytes, completeBlock: false, end, start });
@@ -214,7 +282,11 @@ function splitOversizedPiece(source: string, piece: MarkdownPiece): MarkdownPiec
   return split;
 }
 
-export function chunkMarkdown(source: string, sourceAnchors: MarkdownAnchor[] = []): MarkdownChunk[] {
+export function chunkMarkdown(
+  source: string,
+  sourceAnchors: MarkdownAnchor[] = [],
+  deadline = Number.POSITIVE_INFINITY,
+): MarkdownChunk[] {
   if (source.length === 0) return [];
   const sortedAnchors = sourceAnchors
     .filter((anchor) => Number.isInteger(anchor.offset) && anchor.offset >= 0 &&
@@ -223,11 +295,13 @@ export function chunkMarkdown(source: string, sourceAnchors: MarkdownAnchor[] = 
   const pieces = sourceBlocks(
     source,
     new Set(sortedAnchors.filter((anchor) => anchor.type === "heading").map((anchor) => anchor.offset)),
+    deadline,
   );
   const chunks: MarkdownChunk[] = [];
   let cursor = 0;
 
   while (cursor < pieces.length) {
+    assertWithinDeadline(deadline);
     const first = cursor;
     let bytes = 0;
     while (
@@ -248,9 +322,9 @@ export function chunkMarkdown(source: string, sourceAnchors: MarkdownAnchor[] = 
     chunks.push({
       ...(nearest ? { anchor: { type: nearest.type, value: nearest.value } } : {}),
       end,
-      endLine: lineAt(source, Math.max(start, end - 1)),
+      endLine: lineAt(source, Math.max(start, end - 1), deadline),
       start,
-      startLine: lineAt(source, start),
+      startLine: lineAt(source, start, deadline),
       text: source.slice(start, end),
     });
 
@@ -268,6 +342,110 @@ export function chunkMarkdown(source: string, sourceAnchors: MarkdownAnchor[] = 
     }
   }
   return chunks;
+}
+
+function canvasTextNodes(source: string, deadline = Number.POSITIVE_INFINITY): { id: string; text: string }[] {
+  const parsed: unknown = JSON.parse(source);
+  assertWithinDeadline(deadline);
+  if (!isRecord(parsed) || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) {
+    throw new TypeError("corrupt_or_invalid_canvas");
+  }
+  const ids = new Set<string>();
+  const textNodes: { id: string; text: string }[] = [];
+  for (const node of parsed.nodes) {
+    assertWithinDeadline(deadline);
+    if (!isRecord(node) || typeof node.id !== "string" || node.id.length === 0 || ids.has(node.id) ||
+      ![node.x, node.y, node.width, node.height].every(Number.isFinite) ||
+      !["text", "file", "link", "group"].includes(String(node.type))) {
+      throw new TypeError("corrupt_or_invalid_canvas");
+    }
+    ids.add(node.id);
+    if ((node.type === "text" && typeof node.text !== "string") ||
+      (node.type === "file" && typeof node.file !== "string") ||
+      (node.type === "link" && typeof node.url !== "string")) {
+      throw new TypeError("corrupt_or_invalid_canvas");
+    }
+    if (node.type !== "text") continue;
+    const text = String(node.text);
+    if (text.trim().length === 0) continue;
+    textNodes.push({ id: String(node.id), text });
+  }
+  for (const edge of parsed.edges) {
+    assertWithinDeadline(deadline);
+    if (!isRecord(edge) || typeof edge.id !== "string" ||
+      typeof edge.fromNode !== "string" || typeof edge.toNode !== "string") {
+      throw new TypeError("corrupt_or_invalid_canvas");
+    }
+  }
+  return textNodes;
+}
+
+export function chunkCanvas(source: string): CanvasChunk[] {
+  return chunksForCanvasNodes(canvasTextNodes(source));
+}
+
+function chunksForCanvasNodes(
+  nodes: { id: string; text: string }[],
+  deadline = Number.POSITIVE_INFINITY,
+): CanvasChunk[] {
+  return nodes.flatMap(({ id, text }) => {
+    assertWithinDeadline(deadline);
+    const excerpt = text.trim().replace(/\s+/g, " ");
+    return chunkMarkdown(text, [], deadline).map((chunk) => ({
+      end: chunk.end,
+      excerpt: excerpt.length <= 120 ? excerpt : `${excerpt.slice(0, 119)}…`,
+      nodeId: id,
+      start: chunk.start,
+      text: chunk.text,
+    }));
+  });
+}
+
+const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
+const MEDIA_EXTENSIONS = new Set(["3gp", "flac", "m4a", "mkv", "mov", "mp3", "mp4", "ogg", "ogv", "wav", "webm"]);
+const DOCUMENT_EXTENSIONS = new Set(["doc", "docx", "epub", "key", "numbers", "odp", "ods", "odt", "pages", "ppt", "pptx", "rtf", "xls", "xlsx"]);
+const TEXT_EXTENSIONS = new Set([
+  "c", "cc", "cjs", "conf", "cpp", "cs", "css", "csv", "go", "h", "hpp", "htm", "html",
+  "ini", "ipynb", "java", "js", "jsx", "json", "kt", "kts", "log", "lua", "mdx", "mjs",
+  "php", "pl", "properties", "py", "rb", "rs", "scala", "scss", "sh", "sql", "svelte",
+  "swift", "toml", "ts", "tsx", "tsv", "txt", "vue", "xml", "yaml", "yml",
+]);
+const BINARY_EXTENSIONS = new Set([
+  "7z", "aes", "apk", "appimage", "bin", "bz2", "deb", "dll", "dmg", "dylib", "eml",
+  "enc", "exe", "gpg", "gz", "iso", "jar", "kdbx", "lz", "lz4", "msi", "msg", "pgp",
+  "rar", "rpm", "so", "tar", "war", "xz", "z", "zip", "zst",
+]);
+
+export function classifyVaultSource(
+  path: string,
+  extension: string,
+  rawBytes: number,
+  read: () => Promise<string>,
+  anchors?: MarkdownAnchor[],
+): VaultSource {
+  const normalized = extension.toLowerCase();
+  if (normalized === "md" || normalized === "canvas") {
+    return {
+      ...(normalized === "md" && anchors ? { anchors } : {}),
+      kind: normalized === "md" ? "markdown" : "canvas",
+      path,
+      rawBytes,
+      read,
+    };
+  }
+  if (normalized === "base") return { kind: "ignored_non_content", path, rawBytes, reason: "base_view_definition" };
+  if (normalized === "pdf") return { kind: "unsupported_format", path, rawBytes, reason: "pdf_extraction_not_in_v1" };
+  if (IMAGE_EXTENSIONS.has(normalized)) return { kind: "unsupported_format", path, rawBytes, reason: "ocr_or_vision_not_in_v1" };
+  if (MEDIA_EXTENSIONS.has(normalized)) return { kind: "unsupported_format", path, rawBytes, reason: "transcription_not_in_v1" };
+  if (DOCUMENT_EXTENSIONS.has(normalized)) return { kind: "unsupported_format", path, rawBytes, reason: "document_extractor_not_in_v1" };
+  if (TEXT_EXTENSIONS.has(normalized)) return { kind: "unsupported_format", path, rawBytes, reason: "outside_v1_allowlist" };
+  if (BINARY_EXTENSIONS.has(normalized)) return { kind: "unsupported_format", path, rawBytes, reason: "binary_extractor_not_in_v1" };
+  return {
+    kind: "unrecognized_format",
+    path,
+    rawBytes,
+    reason: normalized ? `unknown_extension:${normalized}` : "extensionless",
+  };
 }
 
 async function sha256(value: string): Promise<string> {
@@ -351,16 +529,48 @@ function compatibleSignature(value: unknown, model: EmbeddingModel): value is Si
     Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
 }
 
-async function prepareSource(source: MarkdownSource): Promise<PreparedSource> {
+async function prepareSource(source: VaultSource): Promise<PreparedSource> {
   const sourceKey = await sha256(source.path);
+  const format = source.kind ?? "markdown";
+  const rawBytes = source.rawBytes ?? 0;
+  if (format !== "markdown" && format !== "canvas") {
+    return {
+      chunks: [],
+      entry: {
+        fingerprint: null,
+        path: source.path,
+        reason: source.reason,
+        sourceKey,
+        status: format,
+      },
+    };
+  }
+  if (rawBytes > RAW_FILE_LIMIT_BYTES) {
+    return {
+      chunks: [],
+      entry: {
+        ceiling: RAW_FILE_LIMIT_BYTES,
+        fingerprint: await sha256(`raw\0${rawBytes}`),
+        limit: "raw_bytes",
+        observed: rawBytes,
+        path: source.path,
+        sourceKey,
+        status: "limit_exceeded",
+      },
+    };
+  }
+  const started = performance.now();
+  const deadline = started + PREPROCESSING_LIMIT_MS;
+  const timeout = Symbol("preprocessing_timeout");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let text: string | typeof timeout;
   try {
-    const text = await source.read();
-    const fingerprint = await sha256(`md\0${text}`);
-    if (text.trim().length === 0) {
-      return { chunks: [], entry: { fingerprint, path: source.path, sourceKey, status: "no_extractable_text" } };
-    }
-    const chunks = chunkMarkdown(text, source.anchors);
-    return { chunks, entry: { fingerprint, path: source.path, sourceKey, status: "indexed" } };
+    text = await Promise.race([
+      source.read?.() ?? Promise.reject(new TypeError("read_failed")),
+      new Promise<typeof timeout>((resolve) => {
+        timer = setTimeout(() => resolve(timeout), PREPROCESSING_LIMIT_MS);
+      }),
+    ]);
   } catch {
     return {
       chunks: [],
@@ -368,6 +578,107 @@ async function prepareSource(source: MarkdownSource): Promise<PreparedSource> {
         fingerprint: null,
         path: source.path,
         reason: "read_failed",
+        sourceKey,
+        status: "extractor_failed",
+      },
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (text === timeout) {
+    return {
+      chunks: [],
+      entry: {
+        ceiling: PREPROCESSING_LIMIT_MS,
+        fingerprint: null,
+        limit: "preprocessing_ms",
+        observed: Math.max(PREPROCESSING_LIMIT_MS, Math.ceil(performance.now() - started)),
+        path: source.path,
+        sourceKey,
+        status: "limit_exceeded",
+      },
+    };
+  }
+
+  const fingerprint = await sha256(`${format}\0${text}`);
+  try {
+    let chunks: PreparedChunk[];
+    let extractedBytes: number;
+    let emptyReason: string;
+    if (format === "markdown") {
+      extractedBytes = byteLength(text);
+      emptyReason = "empty";
+      chunks = extractedBytes > EXTRACTED_TEXT_LIMIT_BYTES || text.trim().length === 0
+        ? []
+        : chunkMarkdown(text, source.anchors, deadline).map((chunk) => ({ ...chunk, format }));
+    } else {
+      const nodes = canvasTextNodes(text, deadline);
+      extractedBytes = nodes.reduce((total, node) => total + byteLength(node.text), 0);
+      emptyReason = "no_canvas_text_nodes";
+      chunks = extractedBytes > EXTRACTED_TEXT_LIMIT_BYTES
+        ? []
+        : chunksForCanvasNodes(nodes, deadline).map((chunk) => ({ ...chunk, format }));
+    }
+    if (extractedBytes > EXTRACTED_TEXT_LIMIT_BYTES) {
+      return {
+        chunks: [],
+        entry: {
+          ceiling: EXTRACTED_TEXT_LIMIT_BYTES,
+          fingerprint,
+          limit: "extracted_text_bytes",
+          observed: extractedBytes,
+          path: source.path,
+          sourceKey,
+          status: "limit_exceeded",
+        },
+      };
+    }
+    const elapsed = Math.ceil(performance.now() - started);
+    if (elapsed > PREPROCESSING_LIMIT_MS) {
+      return {
+        chunks: [],
+        entry: {
+          ceiling: PREPROCESSING_LIMIT_MS,
+          fingerprint,
+          limit: "preprocessing_ms",
+          observed: elapsed,
+          path: source.path,
+          sourceKey,
+          status: "limit_exceeded",
+        },
+      };
+    }
+    if (chunks.length === 0) {
+      return {
+        chunks,
+        entry: { fingerprint, path: source.path, reason: emptyReason, sourceKey, status: "no_extractable_text" },
+      };
+    }
+    return { chunks, entry: { fingerprint, path: source.path, sourceKey, status: "indexed" } };
+  } catch (error) {
+    if (error === preprocessingLimitExceeded) {
+      return {
+        chunks: [],
+        entry: {
+          ceiling: PREPROCESSING_LIMIT_MS,
+          fingerprint,
+          limit: "preprocessing_ms",
+          observed: Math.max(PREPROCESSING_LIMIT_MS, Math.ceil(performance.now() - started)),
+          path: source.path,
+          sourceKey,
+          status: "limit_exceeded",
+        },
+      };
+    }
+    return {
+      chunks: [],
+      entry: {
+        fingerprint,
+        path: source.path,
+        reason: format === "canvas" ||
+          (error instanceof TypeError && error.message === "corrupt_or_invalid_canvas")
+          ? "corrupt_or_invalid_canvas"
+          : "extraction_failed",
         sourceKey,
         status: "extractor_failed",
       },
@@ -381,6 +692,22 @@ function statusCounts(entries: SourceEntry[]): Partial<Record<TerminalStatus, nu
   return counts;
 }
 
+function outcomes(entries: SourceEntry[]): SourceOutcome[] {
+  return entries.map((entry) => entry.status === "limit_exceeded"
+    ? {
+        ceiling: entry.ceiling,
+        limit: entry.limit,
+        observed: entry.observed,
+        path: entry.path,
+        status: entry.status,
+      }
+    : {
+        path: entry.path,
+        ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+        status: entry.status,
+      });
+}
+
 function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
   try {
     const parsed: unknown = JSON.parse(value);
@@ -388,9 +715,16 @@ function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
       !compatibleSignature(parsed.signature, model) || !Array.isArray(parsed.entries)) return null;
     const entries: SourceEntry[] = [];
     for (const item of parsed.entries) {
+      const status = String(isRecord(item) ? item.status : "");
       if (!isRecord(item) || typeof item.path !== "string" || typeof item.sourceKey !== "string" ||
         !(typeof item.fingerprint === "string" || item.fingerprint === null) ||
-        !["indexed", "no_extractable_text", "extractor_failed"].includes(String(item.status))) return null;
+        !["indexed", "no_extractable_text", "ignored_non_content", "unsupported_format",
+          "unrecognized_format", "limit_exceeded", "extractor_failed"].includes(status) ||
+        (status === "limit_exceeded"
+          ? !["raw_bytes", "extracted_text_bytes", "preprocessing_ms"].includes(String(item.limit)) ||
+            !Number.isFinite(item.observed) || !Number.isFinite(item.ceiling) ||
+            Number(item.ceiling) <= 0 || Number(item.observed) < Number(item.ceiling)
+          : item.reason !== undefined && typeof item.reason !== "string")) return null;
       entries.push(item as unknown as SourceEntry);
     }
     return { complete: true, entries, generationId: parsed.generationId, signature: parsed.signature };
@@ -408,12 +742,17 @@ function parseRecord(value: string, entry: SourceEntry, dimension: number): Sour
       if (!isRecord(chunk) || typeof chunk.id !== "string" || !isRecord(chunk.locator) ||
         !validEncodedVector(chunk.vector, dimension)) return null;
       const locator = chunk.locator;
-      if (locator.path !== entry.path || ![locator.start, locator.end, locator.startLine, locator.endLine].every(Number.isInteger) ||
+      if (locator.path !== entry.path || ![locator.start, locator.end].every(Number.isInteger) ||
         Number(locator.start) < 0 || Number(locator.end) <= Number(locator.start) ||
-        Number(locator.startLine) < 1 || Number(locator.endLine) < Number(locator.startLine)) return null;
-      if (locator.anchor !== undefined &&
-        (!isRecord(locator.anchor) || !["heading", "block"].includes(String(locator.anchor.type)) ||
-          typeof locator.anchor.value !== "string" || locator.anchor.value.length === 0)) return null;
+        !["markdown", "canvas"].includes(String(locator.format))) return null;
+      if (locator.format === "markdown") {
+        if (![locator.startLine, locator.endLine].every(Number.isInteger) ||
+          Number(locator.startLine) < 1 || Number(locator.endLine) < Number(locator.startLine)) return null;
+        if (locator.anchor !== undefined &&
+          (!isRecord(locator.anchor) || !["heading", "block"].includes(String(locator.anchor.type)) ||
+            typeof locator.anchor.value !== "string" || locator.anchor.value.length === 0)) return null;
+      } else if (typeof locator.nodeId !== "string" || locator.nodeId.length === 0 ||
+        typeof locator.excerpt !== "string" || locator.excerpt.length === 0) return null;
     }
     return parsed as unknown as SourceRecord;
   } catch {
@@ -421,31 +760,50 @@ function parseRecord(value: string, entry: SourceEntry, dimension: number): Sour
   }
 }
 
-function locatorFor(path: string, chunk: MarkdownChunk): StoredChunk["locator"] {
+function locatorFor(path: string, chunk: PreparedChunk | RetrievedEvidence): StoredLocator {
+  if (chunk.format === "canvas") {
+    if (!chunk.nodeId || !chunk.excerpt) throw new TypeError("invalid_canvas_locator");
+    return {
+      end: chunk.end,
+      excerpt: chunk.excerpt,
+      format: "canvas",
+      nodeId: chunk.nodeId,
+      path,
+      start: chunk.start,
+    };
+  }
+  if (chunk.startLine === undefined || chunk.endLine === undefined) {
+    throw new TypeError("invalid_markdown_locator");
+  }
   return {
     ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
     end: chunk.end,
     endLine: chunk.endLine,
+    format: "markdown",
     path,
     start: chunk.start,
     startLine: chunk.startLine,
   };
 }
 
-function sameLocator(left: StoredChunk["locator"], right: StoredChunk["locator"]): boolean {
-  return left.path === right.path && left.start === right.start && left.end === right.end &&
-    left.startLine === right.startLine && left.endLine === right.endLine &&
-    left.anchor?.type === right.anchor?.type && left.anchor?.value === right.anchor?.value;
+function sameLocator(left: StoredLocator, right: StoredLocator): boolean {
+  if (left.format !== right.format || left.path !== right.path ||
+    left.start !== right.start || left.end !== right.end) return false;
+  return left.format === "canvas" && right.format === "canvas"
+    ? left.nodeId === right.nodeId && left.excerpt === right.excerpt
+    : left.format === "markdown" && right.format === "markdown" &&
+      left.startLine === right.startLine && left.endLine === right.endLine &&
+      left.anchor?.type === right.anchor?.type && left.anchor?.value === right.anchor?.value;
 }
 
-export class MarkdownIndex {
+export class VaultIndex {
   private active?: { catalog: Catalog; model: EmbeddingModel };
   private readonly adapter: IndexAdapter;
   private readonly embed: (
     inputs: string[],
     model: EmbeddingModel,
   ) => Promise<number[][]>;
-  private readonly listSources: () => MarkdownSource[];
+  private readonly listSources: () => VaultSource[];
   private readonly onProgress: (snapshot: IndexSnapshot) => void;
   private readonly queryEmbed: (
     inputs: string[],
@@ -455,13 +813,13 @@ export class MarkdownIndex {
   private replacementQueued = false;
   private revision = 0;
   private readonly root: string;
-  private snapshot: IndexSnapshot = { completed: 0, phase: "idle", statuses: {}, total: 0 };
+  private snapshot: IndexSnapshot = { completed: 0, outcomes: [], phase: "idle", statuses: {}, total: 0 };
   private readonly validateModel: (model: EmbeddingModel) => Promise<boolean>;
 
   constructor(
     adapter: IndexAdapter,
     root: string,
-    listSources: () => MarkdownSource[],
+    listSources: () => VaultSource[],
     embed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]>,
     onProgress: (snapshot: IndexSnapshot) => void = () => undefined,
     queryEmbed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]> = embed,
@@ -481,7 +839,11 @@ export class MarkdownIndex {
   }
 
   getSnapshot(): IndexSnapshot {
-    return { ...this.snapshot, statuses: { ...this.snapshot.statuses } };
+    return {
+      ...this.snapshot,
+      outcomes: this.snapshot.outcomes.map((outcome) => ({ ...outcome })),
+      statuses: { ...this.snapshot.statuses },
+    };
   }
 
   async retrieve(question: string): Promise<RetrievedEvidence[]> {
@@ -586,7 +948,7 @@ export class MarkdownIndex {
     entry: SourceEntry,
     stored: StoredChunk,
     score: number,
-    source: MarkdownSource,
+    source: VaultSource,
   ): Promise<Omit<RetrievedEvidence, "citationId"> | null> {
     const prepared = await prepareSource(source);
     if (
@@ -599,33 +961,36 @@ export class MarkdownIndex {
     const chunk = prepared.chunks.find((item) => sameLocator(stored.locator, locatorFor(source.path, item)));
     if (!chunk || !entry.fingerprint) return null;
     return {
-      ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
+      ...(chunk.format === "markdown" && chunk.anchor ? { anchor: chunk.anchor } : {}),
       chunkId: stored.id,
       end: chunk.end,
-      endLine: chunk.endLine,
+      ...(chunk.format === "markdown" ? { endLine: chunk.endLine, startLine: chunk.startLine } : {
+        excerpt: chunk.excerpt,
+        nodeId: chunk.nodeId,
+      }),
       fingerprint: entry.fingerprint,
+      format: chunk.format,
       path: source.path,
       score,
       start: chunk.start,
-      startLine: chunk.startLine,
       text: chunk.text,
     };
   }
 
   async start(model: EmbeddingModel): Promise<IndexSnapshot> {
     const revision = ++this.revision;
-    if (!validModel(model)) return this.update({ completed: 0, phase: "failed", statuses: {}, total: 0 });
+    if (!validModel(model)) return this.update({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
     const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
     try {
       if (!(await this.validateModel(model))) throw new Error("embedding_model_unavailable");
       this.assertCurrent(revision);
-      this.update({ completed: 0, phase: "indexing", statuses: {}, total: sources.length });
+      this.update({ completed: 0, outcomes: [], phase: "indexing", statuses: {}, total: sources.length });
       const restored = await this.restore(model, sources, revision);
       if (restored) return restored;
       return await this.build(model, sources, revision);
     } catch {
       if (revision !== this.revision) return this.getSnapshot();
-      return this.update({ completed: 0, phase: "failed", statuses: {}, total: sources.length });
+      return this.update({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: sources.length });
     }
   }
 
@@ -650,7 +1015,7 @@ export class MarkdownIndex {
 
   private async restore(
     model: EmbeddingModel,
-    sources: MarkdownSource[],
+    sources: VaultSource[],
     revision: number,
   ): Promise<IndexSnapshot | null> {
     const activePath = `${this.root}/active.json`;
@@ -694,6 +1059,7 @@ export class MarkdownIndex {
     this.active = { catalog, model };
     return this.update({
       completed: sources.length,
+      outcomes: outcomes(catalog.entries),
       phase: "ready",
       statuses: statusCounts(catalog.entries),
       total: sources.length,
@@ -702,7 +1068,7 @@ export class MarkdownIndex {
 
   private async build(
     model: EmbeddingModel,
-    sources: MarkdownSource[],
+    sources: VaultSource[],
     revision: number,
   ): Promise<IndexSnapshot> {
     const generationId = globalThis.crypto.randomUUID();
@@ -755,6 +1121,7 @@ export class MarkdownIndex {
         this.update({
           completed: entries.length,
           latestPath: source.path,
+          outcomes: outcomes(entries),
           phase: "indexing",
           statuses: statusCounts(entries),
           total: sources.length,
@@ -788,6 +1155,7 @@ export class MarkdownIndex {
       this.active = { catalog, model };
       const ready = this.update({
         completed: sources.length,
+        outcomes: outcomes(entries),
         phase: "ready",
         statuses: statusCounts(entries),
         total: sources.length,
