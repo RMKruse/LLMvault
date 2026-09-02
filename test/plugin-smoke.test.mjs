@@ -14,5 +14,7 @@ test("build produces an installable desktop Vault Chat plugin", async () => {
   assert.equal(manifest.minAppVersion, "1.13.7");
   assert.equal(manifest.isDesktopOnly, true);
   assert.match(bundle, /vault-chat-view/);
+  assert.match(bundle, /127\.0\.0\.1/);
+  assert.match(bundle, /remote_model_disallowed/);
   assert.match(styles, /\.llmvault-chat/);
 });

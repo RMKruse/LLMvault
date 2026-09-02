@@ -9,8 +9,9 @@
     "build": "npm run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
+    "test:unit": "node --experimental-strip-types --test test/ollama.test.mjs",
     "test:smoke": "npm run build && node --test test/plugin-smoke.test.mjs",
-    "test": "npm run test:smoke"
+    "test": "npm run test:unit && npm run test:smoke"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

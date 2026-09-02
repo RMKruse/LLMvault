@@ -40,8 +40,28 @@
 
 .llmvault-chat__setup {
   display: grid;
-  gap: var(--size-4-1);
+  gap: var(--size-4-2);
   border-color: var(--interactive-accent);
+}
+
+.llmvault-chat__setup-form {
+  display: grid;
+  gap: var(--size-4-2);
+}
+
+.llmvault-chat__field {
+  display: grid;
+  gap: var(--size-2-1);
+}
+
+.llmvault-chat__field input,
+.llmvault-chat__field select {
+  width: 100%;
+}
+
+.llmvault-chat__disclosure {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
 }
 
 .llmvault-chat__answer,
