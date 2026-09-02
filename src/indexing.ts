@@ -1,9 +1,6 @@
 export const CHUNK_TARGET_BYTES = 2_048;
 export const CHUNK_OVERLAP_BYTES = 512;
 
-const RAW_SOURCE_LIMIT_BYTES = 10 * 1024 * 1024;
-const EXTRACTED_TEXT_LIMIT_BYTES = 5 * 1024 * 1024;
-const SOURCE_WORK_LIMIT_MS = 5_000;
 const EMBEDDING_BATCH_SIZE = 16;
 const SCHEMA_VERSION = 1;
 const EXTRACTOR_VERSION = 1;
@@ -12,13 +9,16 @@ const CHUNKER_VERSION = 1;
 type TerminalStatus =
   | "indexed"
   | "no_extractable_text"
-  | "limit_exceeded"
   | "extractor_failed";
 
-type Anchor = { type: "heading" | "block"; value: string };
+export type MarkdownAnchor = {
+  offset: number;
+  type: "heading" | "block";
+  value: string;
+};
 
 export interface MarkdownChunk {
-  anchor?: Anchor;
+  anchor?: Omit<MarkdownAnchor, "offset">;
   end: number;
   endLine: number;
   start: number;
@@ -27,9 +27,9 @@ export interface MarkdownChunk {
 }
 
 export interface MarkdownSource {
+  anchors?: MarkdownAnchor[];
   path: string;
   read(): Promise<string>;
-  size: number;
 }
 
 export interface EmbeddingModel {
@@ -59,7 +59,7 @@ interface SourceEntry {
   chunkCount?: number;
   fingerprint: string | null;
   path: string;
-  reason?: "raw_source_too_large" | "extracted_text_too_large" | "source_work_timeout" | "read_failed";
+  reason?: "read_failed";
   record?: string;
   sourceKey: string;
   status: TerminalStatus;
@@ -86,7 +86,7 @@ interface Catalog {
 
 interface StoredChunk {
   id: string;
-  locator: Omit<MarkdownChunk, "text">;
+  locator: Omit<MarkdownChunk, "text"> & { path: string };
   vector: string;
 }
 
@@ -102,7 +102,7 @@ interface PreparedSource {
   entry: SourceEntry;
 }
 
-interface Piece {
+interface MarkdownPiece {
   bytes: number;
   completeBlock: boolean;
   end: number;
@@ -123,25 +123,14 @@ function lineAt(source: string, offset: number): number {
   return line;
 }
 
-function anchors(source: string): Array<Anchor & { offset: number }> {
-  const found: Array<Anchor & { offset: number }> = [];
-  for (const match of source.matchAll(/^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/gm)) {
-    found.push({ offset: match.index, type: "heading", value: match[2] ?? "" });
-  }
-  for (const match of source.matchAll(/\^([A-Za-z0-9-]+)[ \t]*$/gm)) {
-    found.push({ offset: match.index, type: "block", value: match[1] ?? "" });
-  }
-  return found.sort((left, right) => left.offset - right.offset);
-}
-
-function sourceBlocks(source: string): Piece[] {
-  const blocks: Piece[] = [];
+function sourceBlocks(source: string, headingOffsets: Set<number>): MarkdownPiece[] {
+  const blocks: MarkdownPiece[] = [];
   let blockStart = 0;
   let offset = 0;
   for (const line of source.matchAll(/.*(?:\n|$)/g)) {
     const value = line[0];
     if (value.length === 0) continue;
-    const heading = /^#{1,6}[ \t]+/.test(value);
+    const heading = headingOffsets.has(offset);
     if (heading && offset > blockStart) {
       blocks.push({
         bytes: byteLength(source.slice(blockStart, offset)),
@@ -173,9 +162,9 @@ function sourceBlocks(source: string): Piece[] {
   return blocks.flatMap((block) => splitOversizedPiece(source, block));
 }
 
-function splitOversizedPiece(source: string, piece: Piece): Piece[] {
+function splitOversizedPiece(source: string, piece: MarkdownPiece): MarkdownPiece[] {
   if (piece.bytes <= CHUNK_TARGET_BYTES) return [piece];
-  const split: Piece[] = [];
+  const split: MarkdownPiece[] = [];
   let packedStart = piece.start;
   let packedEnd = piece.start;
   let packedBytes = 0;
@@ -217,10 +206,16 @@ function splitOversizedPiece(source: string, piece: Piece): Piece[] {
   return split;
 }
 
-export function chunkMarkdown(source: string): MarkdownChunk[] {
+export function chunkMarkdown(source: string, sourceAnchors: MarkdownAnchor[] = []): MarkdownChunk[] {
   if (source.length === 0) return [];
-  const pieces = sourceBlocks(source);
-  const sourceAnchors = anchors(source);
+  const sortedAnchors = sourceAnchors
+    .filter((anchor) => Number.isInteger(anchor.offset) && anchor.offset >= 0 &&
+      anchor.offset < source.length && anchor.value.length > 0)
+    .sort((left, right) => left.offset - right.offset);
+  const pieces = sourceBlocks(
+    source,
+    new Set(sortedAnchors.filter((anchor) => anchor.type === "heading").map((anchor) => anchor.offset)),
+  );
   const chunks: MarkdownChunk[] = [];
   let cursor = 0;
 
@@ -237,8 +232,8 @@ export function chunkMarkdown(source: string): MarkdownChunk[] {
     const start = pieces[first]?.start;
     const end = pieces[cursor - 1]?.end;
     if (start === undefined || end === undefined) break;
-    let nearest = sourceAnchors.find((anchor) => anchor.offset < end);
-    for (const anchor of sourceAnchors) {
+    let nearest = sortedAnchors.find((anchor) => anchor.offset < end);
+    for (const anchor of sortedAnchors) {
       if (anchor.offset > start) break;
       nearest = anchor;
     }
@@ -338,59 +333,25 @@ function compatibleSignature(value: unknown, model: EmbeddingModel): value is Si
     Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
 }
 
-async function withDeadline<T>(work: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      work,
-      new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("source_work_timeout")), SOURCE_WORK_LIMIT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
 async function prepareSource(source: MarkdownSource): Promise<PreparedSource> {
   const sourceKey = await sha256(source.path);
-  if (source.size > RAW_SOURCE_LIMIT_BYTES) {
-    return {
-      chunks: [],
-      entry: { fingerprint: null, path: source.path, reason: "raw_source_too_large", sourceKey, status: "limit_exceeded" },
-    };
-  }
   try {
-    const started = performance.now();
-    const text = await withDeadline(source.read());
+    const text = await source.read();
     const fingerprint = await sha256(`md\0${text}`);
-    if (byteLength(text) > EXTRACTED_TEXT_LIMIT_BYTES) {
-      return {
-        chunks: [],
-        entry: { fingerprint, path: source.path, reason: "extracted_text_too_large", sourceKey, status: "limit_exceeded" },
-      };
-    }
     if (text.trim().length === 0) {
       return { chunks: [], entry: { fingerprint, path: source.path, sourceKey, status: "no_extractable_text" } };
     }
-    const chunks = chunkMarkdown(text);
-    if (performance.now() - started > SOURCE_WORK_LIMIT_MS) {
-      return {
-        chunks: [],
-        entry: { fingerprint, path: source.path, reason: "source_work_timeout", sourceKey, status: "limit_exceeded" },
-      };
-    }
+    const chunks = chunkMarkdown(text, source.anchors);
     return { chunks, entry: { fingerprint, path: source.path, sourceKey, status: "indexed" } };
-  } catch (error) {
-    const timedOut = error instanceof Error && error.message === "source_work_timeout";
+  } catch {
     return {
       chunks: [],
       entry: {
         fingerprint: null,
         path: source.path,
-        reason: timedOut ? "source_work_timeout" : "read_failed",
+        reason: "read_failed",
         sourceKey,
-        status: timedOut ? "limit_exceeded" : "extractor_failed",
+        status: "extractor_failed",
       },
     };
   }
@@ -411,7 +372,7 @@ function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
     for (const item of parsed.entries) {
       if (!isRecord(item) || typeof item.path !== "string" || typeof item.sourceKey !== "string" ||
         !(typeof item.fingerprint === "string" || item.fingerprint === null) ||
-        !["indexed", "no_extractable_text", "limit_exceeded", "extractor_failed"].includes(String(item.status))) return null;
+        !["indexed", "no_extractable_text", "extractor_failed"].includes(String(item.status))) return null;
       entries.push(item as unknown as SourceEntry);
     }
     return { complete: true, entries, generationId: parsed.generationId, signature: parsed.signature };
@@ -429,12 +390,34 @@ function parseRecord(value: string, entry: SourceEntry, dimension: number): Sour
       if (!isRecord(chunk) || typeof chunk.id !== "string" || !isRecord(chunk.locator) ||
         !validEncodedVector(chunk.vector, dimension)) return null;
       const locator = chunk.locator;
-      if (![locator.start, locator.end, locator.startLine, locator.endLine].every(Number.isInteger)) return null;
+      if (locator.path !== entry.path || ![locator.start, locator.end, locator.startLine, locator.endLine].every(Number.isInteger) ||
+        Number(locator.start) < 0 || Number(locator.end) <= Number(locator.start) ||
+        Number(locator.startLine) < 1 || Number(locator.endLine) < Number(locator.startLine)) return null;
+      if (locator.anchor !== undefined &&
+        (!isRecord(locator.anchor) || !["heading", "block"].includes(String(locator.anchor.type)) ||
+          typeof locator.anchor.value !== "string" || locator.anchor.value.length === 0)) return null;
     }
     return parsed as unknown as SourceRecord;
   } catch {
     return null;
   }
+}
+
+function locatorFor(path: string, chunk: MarkdownChunk): StoredChunk["locator"] {
+  return {
+    ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
+    end: chunk.end,
+    endLine: chunk.endLine,
+    path,
+    start: chunk.start,
+    startLine: chunk.startLine,
+  };
+}
+
+function sameLocator(left: StoredChunk["locator"], right: StoredChunk["locator"]): boolean {
+  return left.path === right.path && left.start === right.start && left.end === right.end &&
+    left.startLine === right.startLine && left.endLine === right.endLine &&
+    left.anchor?.type === right.anchor?.type && left.anchor?.value === right.anchor?.value;
 }
 
 export class MarkdownIndex {
@@ -536,6 +519,12 @@ export class MarkdownIndex {
           catalog.signature.vectorDimension,
         );
         if (!record || record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
+        for (let ordinal = 0; ordinal < prepared.chunks.length; ordinal += 1) {
+          const stored = record.chunks[ordinal];
+          const current = prepared.chunks[ordinal];
+          if (!stored || !current || stored.id !== `${expected.sourceKey}:${expected.fingerprint}:${ordinal}` ||
+            !sameLocator(stored.locator, locatorFor(source.path, current))) return null;
+        }
       }
     }
     return this.update({
@@ -579,13 +568,7 @@ export class MarkdownIndex {
               const ordinal = offset + index;
               storedChunks.push({
                 id: `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
-                locator: {
-                  ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
-                  end: chunk.end,
-                  endLine: chunk.endLine,
-                  start: chunk.start,
-                  startLine: chunk.startLine,
-                },
+                locator: locatorFor(source.path, chunk),
                 vector: encodeVector(vector),
               });
             }
@@ -632,7 +615,7 @@ export class MarkdownIndex {
       if (await this.adapter.exists(activePath)) {
         try {
           const previous: unknown = JSON.parse(await this.adapter.read(activePath));
-          if (isRecord(previous) && typeof previous.generationId === "string") previousGeneration = previous.generationId;
+          if (isRecord(previous) && isGenerationId(previous.generationId)) previousGeneration = previous.generationId;
         } catch {
           previousGeneration = undefined;
         }

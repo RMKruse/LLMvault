@@ -49,7 +49,9 @@ class MemoryAdapter {
 
 test("Markdown chunks keep source locations and overlap only a complete block", () => {
   const source = `# Alpha\n\n${"x".repeat(1_600)}\n\n${"y".repeat(400)}\n\n${"z".repeat(400)}`;
-  const chunks = chunkMarkdown(source);
+  const chunks = chunkMarkdown(source, [
+    { offset: 0, type: "heading", value: "Alpha" },
+  ]);
   const yStart = source.indexOf("y".repeat(400));
 
   assert.equal(chunks.length, 2);
@@ -80,6 +82,11 @@ test("oversized Markdown lines split at Unicode code-point boundaries", () => {
   );
 });
 
+test("only Obsidian-confirmed headings and blocks become citation anchors", () => {
+  const source = "```md\n# Not a heading\n^not-a-block\n```";
+  assert.ok(chunkMarkdown(source).every(({ anchor }) => anchor === undefined));
+});
+
 test("vectors are persisted as explicitly little-endian Float32", () => {
   assert.equal(encodeVector([1, -2.5]), "AACAPwAAIMA=");
 });
@@ -87,8 +94,12 @@ test("vectors are persisted as explicitly little-endian Float32", () => {
 test("a completed generation is restored without embedding unchanged Markdown", async () => {
   const adapter = new MemoryAdapter();
   const sources = [
-    { path: "Notes/alpha.md", size: 13, read: async () => "# Alpha\nBody" },
-    { path: "Notes/empty.md", size: 3, read: async () => " \n " },
+    {
+      anchors: [{ offset: 0, type: "heading", value: "Alpha" }],
+      path: "Notes/alpha.md",
+      read: async () => "# Alpha\nBody",
+    },
+    { path: "Notes/empty.md", read: async () => " \n " },
   ];
   let embedCalls = 0;
   const embed = async (inputs) => {
@@ -111,6 +122,14 @@ test("a completed generation is restored without embedding unchanged Markdown", 
     [...adapter.files.values()].some((value) => value.includes("# Alpha\nBody")),
     false,
   );
+
+  const recordPath = [...adapter.files.keys()].find((path) => path.includes("/records/"));
+  const record = JSON.parse(await adapter.read(recordPath));
+  record.chunks[0].locator.start += 1;
+  await adapter.write(recordPath, JSON.stringify(record));
+  const corrupted = new MarkdownIndex(adapter, "plugin/index-v1", () => sources, embed);
+  assert.equal((await corrupted.start(model)).phase, "ready");
+  assert.ok(embedCalls > callsAfterBuild);
 });
 
 test("invalid embedding vectors never activate a generation", async () => {
@@ -118,7 +137,7 @@ test("invalid embedding vectors never activate a generation", async () => {
   const index = new MarkdownIndex(
     adapter,
     "plugin/index-v1",
-    () => [{ path: "bad.md", size: 4, read: async () => "text" }],
+    () => [{ path: "bad.md", read: async () => "text" }],
     async () => [[Number.NaN]],
   );
 

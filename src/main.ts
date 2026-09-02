@@ -2,6 +2,7 @@ import { ItemView, Plugin, WorkspaceLeaf } from "obsidian";
 
 import {
   type IndexSnapshot,
+  type MarkdownAnchor,
   MarkdownIndex,
   type MarkdownSource,
 } from "./indexing";
@@ -582,11 +583,26 @@ export default class LLMvaultPlugin extends Plugin {
     return this.app.vault
       .getMarkdownFiles()
       .filter((file) => file.path !== this.app.vault.configDir && !file.path.startsWith(configurationRoot))
-      .map((file) => ({
-        path: file.path,
-        read: () => this.app.vault.cachedRead(file),
-        size: file.stat.size,
-      }));
+      .map((file) => {
+        const cache = this.app.metadataCache.getFileCache(file);
+        const anchors: MarkdownAnchor[] = [
+          ...(cache?.headings ?? []).map((heading) => ({
+            offset: heading.position.start.offset,
+            type: "heading" as const,
+            value: heading.heading,
+          })),
+          ...Object.values(cache?.blocks ?? {}).map((block) => ({
+            offset: block.position.start.offset,
+            type: "block" as const,
+            value: block.id,
+          })),
+        ];
+        return {
+          anchors,
+          path: file.path,
+          read: () => this.app.vault.cachedRead(file),
+        };
+      });
   }
 
   private reportIndex(snapshot: IndexSnapshot): void {
