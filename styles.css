@@ -3,17 +3,24 @@
   grid-template-areas:
     "header"
     "history"
-    "setup"
-    "index"
     "evidence"
     "answer"
     "composer";
-  grid-template-rows: auto auto auto 16rem 18rem minmax(10rem, 1fr) auto;
+  grid-template-rows: auto auto 18rem minmax(10rem, 1fr) auto;
   gap: var(--size-4-3);
   height: 100%;
   padding: var(--size-4-3);
   color: var(--text-normal);
   background: var(--background-primary);
+}
+
+.llmvault-chat--management {
+  grid-template-areas:
+    "header"
+    "history"
+    "setup"
+    "index";
+  grid-template-rows: auto auto auto minmax(16rem, 1fr);
 }
 
 .llmvault-chat__header {
@@ -64,6 +71,24 @@
 }
 
 .llmvault-chat__history[hidden] {
+  display: none;
+}
+
+.llmvault-chat__navigation {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--size-2-1);
+}
+
+.llmvault-chat__navigation > button.is-active {
+  border-color: var(--interactive-accent);
+}
+
+.llmvault-chat__setup[hidden],
+.llmvault-chat__index[hidden],
+.llmvault-chat__evidence[hidden],
+.llmvault-chat__answer[hidden],
+.llmvault-chat__composer[hidden] {
   display: none;
 }
 

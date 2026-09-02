@@ -9,6 +9,8 @@ Use Local Models to ask questions grounded in your Obsidian vault. LLMvault is a
 3. Open **Vault Chat** from the ribbon or command palette.
 4. Enter the Ollama port, refresh the installed models, explicitly choose one compatible model for chat and one for embeddings, and complete setup.
 
+After setup, the chat stays focused on conversations. Open the menu and choose **Vault index & Local Models** to inspect or rebuild the index or change the local-model connection.
+
 LLMvault indexes Markdown (`.md`) and the text nodes of Canvas (`.canvas`) files. It reports empty, unsupported, unrecognized, oversized, or failed files instead of silently indexing them. Bases (`.base`) are ignored as non-content. PDF, images, media, office files, archives, OCR, and transcription are not supported.
 
 ## Local Processing and network use

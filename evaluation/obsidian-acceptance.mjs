@@ -304,7 +304,7 @@ async function rendererSetup(config) {
     const expectedAt = performance.now() + delayMs;
     state.uiTimer = setTimeout(() => {
       if (state.uiPhase !== phase) return;
-      const button = view().contentEl.querySelector('button[aria-label="Open conversations"]');
+      const button = view().contentEl.querySelector('button[aria-label="Open Vault Chat menu"]');
       if (!button) {
         scheduleUi(phase, 25);
         return;

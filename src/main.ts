@@ -80,6 +80,7 @@ class VaultChatView extends ItemView {
   private historyStatus = "";
   private indexEl?: HTMLElement;
   private indexUnsubscribe?: () => void;
+  private managementOpen: boolean;
   private mutationUnsubscribe?: () => void;
   private questionEl?: HTMLTextAreaElement;
   private requestGeneration = 0;
@@ -97,6 +98,8 @@ class VaultChatView extends ItemView {
     this.portValue = String(settings.ollamaPort);
     this.chatModel = settings.chatModel;
     this.embeddingModel = settings.embeddingModel;
+    this.managementOpen =
+      !settings.chatModel || !settings.embeddingModel || plugin.isStopped();
     if (plugin.isStopped()) this.status = "Vault Chat is stopped. Connection settings are retained.";
     if (plugin.isDeletionIncomplete()) this.deletionState = "failed";
   }
@@ -127,7 +130,9 @@ class VaultChatView extends ItemView {
         this.renderComposerState(snapshot);
         return;
       }
-      if (snapshot.available && !this.answering) void this.renderSelectedConversation();
+      if (snapshot.available && !this.answering && !this.managementOpen) {
+        void this.renderSelectedConversation();
+      }
     });
     this.mutationUnsubscribe = this.plugin.subscribeMutations((paths) => {
       this.vaultContentChanged(paths);
@@ -154,15 +159,14 @@ class VaultChatView extends ItemView {
     const history = header.createEl("button", {
       attr: {
         "aria-expanded": "false",
-        "aria-label": "Open conversations",
-        title: "Open conversations",
+        "aria-label": "Open Vault Chat menu",
+        title: "Open Vault Chat menu",
         type: "button",
       },
       text: "☰",
     });
     history.onclick = () => {
       this.historyOpen = !this.historyOpen;
-      history.setAttribute("aria-expanded", String(this.historyOpen));
       this.renderHistory();
     };
     this.conversationTitleEl = header.createEl("h2", { text: "Vault Chat" });
@@ -242,14 +246,34 @@ class VaultChatView extends ItemView {
       text: "Ask",
     });
     this.renderIndex();
+    this.renderLayout();
     void this.renderSelectedConversation();
   }
 
   private renderHistory(): void {
     const history = this.historyEl;
     if (!history) return;
+    this.contentEl
+      .querySelector('button[aria-label="Open Vault Chat menu"]')
+      ?.setAttribute("aria-expanded", String(this.historyOpen));
     history.hidden = !this.historyOpen;
     history.empty();
+    const navigation = history.createDiv({ cls: "llmvault-chat__navigation" });
+    const chat = navigation.createEl("button", {
+      attr: { type: "button" },
+      cls: this.managementOpen ? "" : "is-active",
+      text: "Chat",
+    });
+    const settings = this.plugin.getSettings();
+    chat.disabled =
+      !settings.chatModel || !settings.embeddingModel || this.plugin.isStopped();
+    chat.onclick = () => this.showChat();
+    const management = navigation.createEl("button", {
+      attr: { type: "button" },
+      cls: this.managementOpen ? "is-active" : "",
+      text: "Vault index & Local Models",
+    });
+    management.onclick = () => this.showManagement();
     history.createEl("h3", { text: "Local conversations" });
     if (this.historyStatus) {
       history.createEl("p", {
@@ -289,6 +313,35 @@ class VaultChatView extends ItemView {
     return excerpt.length < answer.trim().length ? `${excerpt}…` : excerpt;
   }
 
+  private renderLayout(): void {
+    this.contentEl.classList.toggle("llmvault-chat--management", this.managementOpen);
+    if (this.setupEl) this.setupEl.hidden = !this.managementOpen;
+    if (this.indexEl) this.indexEl.hidden = !this.managementOpen;
+    if (this.evidenceEl) this.evidenceEl.hidden = this.managementOpen;
+    if (this.answerEl) this.answerEl.hidden = this.managementOpen;
+    const composer = this.questionEl?.form;
+    if (composer) composer.hidden = this.managementOpen;
+    if (this.managementOpen) {
+      this.conversationTitleEl?.setText("Vault index & Local Models");
+    }
+  }
+
+  private showChat(): void {
+    this.managementOpen = false;
+    this.historyOpen = false;
+    this.renderHistory();
+    this.renderLayout();
+    void this.renderSelectedConversation();
+  }
+
+  private showManagement(): void {
+    this.cancelAnswer();
+    this.managementOpen = true;
+    this.historyOpen = false;
+    this.renderHistory();
+    this.renderLayout();
+  }
+
   private cancelAnswer(): void {
     this.requestGeneration += 1;
     this.plugin.abortAnswerRequests();
@@ -298,6 +351,7 @@ class VaultChatView extends ItemView {
   }
 
   private async startNewConversation(): Promise<void> {
+    this.showChat();
     this.displayGeneration += 1;
     this.cancelAnswer();
     try {
@@ -311,6 +365,7 @@ class VaultChatView extends ItemView {
   }
 
   private async resumeConversation(id: string): Promise<void> {
+    this.showChat();
     this.displayGeneration += 1;
     this.cancelAnswer();
     try {
@@ -347,6 +402,7 @@ class VaultChatView extends ItemView {
   }
 
   private async renderSelectedConversation(): Promise<void> {
+    if (this.managementOpen) return;
     const state = this.plugin.getConversationState();
     const conversation = state.conversations.find(({ id }) => id === state.selectedConversationId);
     if (!conversation) {
@@ -884,11 +940,13 @@ class VaultChatView extends ItemView {
     this.requestGeneration += 1;
     this.displayGeneration += 1;
     this.deletionState = "deleting";
+    this.managementOpen = true;
     this.busy = true;
     this.answering = false;
     this.historyOpen = false;
     this.historyEl?.empty();
     this.clearConversation();
+    this.renderLayout();
     this.renderSetup();
     this.renderComposerState();
     try {
@@ -964,6 +1022,10 @@ class VaultChatView extends ItemView {
       const revalidated = revalidateSelections(settings, discovery);
       this.chatModel = revalidated.settings.chatModel;
       this.embeddingModel = revalidated.settings.embeddingModel;
+      if (!this.chatModel || !this.embeddingModel) {
+        this.managementOpen = true;
+        this.renderLayout();
+      }
       if (
         saved.ollamaPort === port &&
         (saved.chatModel !== this.chatModel ||
@@ -1051,6 +1113,7 @@ class VaultChatView extends ItemView {
       await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel });
       this.status = "Setup complete. Both Local Models are compatible; indexing is starting.";
       await this.plugin.resumeVaultChat(this.discovery, embeddingModel);
+      this.showChat();
     } catch (error) {
       if (requestGeneration !== this.requestGeneration) return;
       this.status = this.errorMessage(error);
