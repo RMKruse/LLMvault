@@ -137,6 +137,66 @@ test("a completed generation is restored without embedding unchanged Markdown", 
   assert.ok(embedCalls > callsAfterBuild);
 });
 
+test("questions retrieve at most four fresh sources with the generation's pinned model", async () => {
+  const adapter = new MemoryAdapter();
+  const texts = new Map([
+    ["one.md", "0.1"],
+    ["two.md", "0.2"],
+    ["three.md", "0.3"],
+    ["four.md", "0.4"],
+    ["five.md", "0.5"],
+  ]);
+  const sources = [...texts.keys()].map((path) => ({
+    path,
+    read: async () => texts.get(path),
+  }));
+  const model = { name: "pinned-embed", digest: "sha256:pinned" };
+  const models = [];
+  const validatedModels = [];
+  const embed = async (inputs, requestedModel) => {
+    models.push(requestedModel);
+    return inputs.map((input) =>
+      input === "Which source is strongest?" ? [1, 0] : [Number(input), 0],
+    );
+  };
+  const index = new MarkdownIndex(
+    adapter,
+    "plugin/index-v1",
+    () => sources,
+    embed,
+    undefined,
+    undefined,
+    async (requestedModel) => {
+      validatedModels.push(requestedModel);
+      return true;
+    },
+  );
+  await index.start(model);
+
+  const evidence = await index.retrieve("Which source is strongest?");
+
+  assert.deepEqual(
+    evidence.map(({ citationId, path, text }) => [citationId, path, text]),
+    [
+      ["S1-1", "five.md", "0.5"],
+      ["S1-2", "four.md", "0.4"],
+      ["S1-3", "three.md", "0.3"],
+      ["S1-4", "two.md", "0.2"],
+    ],
+  );
+  assert.ok(models.every((requestedModel) => requestedModel === model));
+
+  texts.set("five.md", "changed after indexing");
+  const freshEvidence = await index.retrieve("Which source is strongest?");
+
+  assert.deepEqual(
+    freshEvidence.map(({ path }) => path),
+    ["four.md", "three.md", "two.md", "one.md"],
+  );
+  assert.deepEqual(validatedModels, [model, model]);
+  assert.equal(index.getSnapshot().phase, "indexing");
+});
+
 test("invalid embedding vectors never activate a generation", async () => {
   const adapter = new MemoryAdapter();
   const index = new MarkdownIndex(

@@ -82,6 +82,44 @@
   max-height: 12rem;
 }
 
+.llmvault-chat__answer-text,
+.llmvault-chat__preview pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.llmvault-chat__citation {
+  margin-inline: var(--size-2-1);
+  padding: 0 var(--size-2-2);
+  border: 1px solid var(--interactive-accent);
+  border-radius: var(--radius-s);
+}
+
+.llmvault-chat__source {
+  display: grid;
+  gap: var(--size-2-1);
+  width: 100%;
+  padding: var(--size-4-2);
+  text-align: start;
+}
+
+.llmvault-chat__preview {
+  display: grid;
+  gap: var(--size-4-2);
+  padding-top: var(--size-4-2);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.llmvault-chat__preview pre {
+  max-height: 8rem;
+  margin: 0;
+  overflow: auto;
+}
+
+.llmvault-chat__incomplete {
+  color: var(--text-warning);
+}
+
 .llmvault-chat__placeholder {
   color: var(--text-muted);
 }

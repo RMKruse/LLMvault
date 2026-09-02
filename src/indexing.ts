@@ -45,6 +45,15 @@ export interface IndexSnapshot {
   total: number;
 }
 
+export interface RetrievedEvidence extends Omit<MarkdownChunk, "text"> {
+  citationId: string;
+  chunkId: string;
+  fingerprint: string;
+  path: string;
+  score: number;
+  text: string;
+}
+
 interface IndexAdapter {
   exists(path: string): Promise<boolean>;
   mkdir(path: string): Promise<void>;
@@ -300,6 +309,16 @@ function validEncodedVector(value: unknown, dimension: number): boolean {
   }
 }
 
+function decodeVector(value: string, dimension: number): Float32Array {
+  const binary = atob(value);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const view = new DataView(bytes.buffer);
+  return Float32Array.from(
+    { length: dimension },
+    (_item, index) => view.getFloat32(index * 4, true),
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -420,26 +439,41 @@ function sameLocator(left: StoredChunk["locator"], right: StoredChunk["locator"]
 }
 
 export class MarkdownIndex {
+  private active?: { catalog: Catalog; model: EmbeddingModel };
   private readonly adapter: IndexAdapter;
-  private readonly embed: (inputs: string[]) => Promise<number[][]>;
+  private readonly embed: (
+    inputs: string[],
+    model: EmbeddingModel,
+  ) => Promise<number[][]>;
   private readonly listSources: () => MarkdownSource[];
   private readonly onProgress: (snapshot: IndexSnapshot) => void;
+  private readonly queryEmbed: (
+    inputs: string[],
+    model: EmbeddingModel,
+  ) => Promise<number[][]>;
+  private querySequence = 0;
+  private replacementQueued = false;
   private revision = 0;
   private readonly root: string;
   private snapshot: IndexSnapshot = { completed: 0, phase: "idle", statuses: {}, total: 0 };
+  private readonly validateModel: (model: EmbeddingModel) => Promise<boolean>;
 
   constructor(
     adapter: IndexAdapter,
     root: string,
     listSources: () => MarkdownSource[],
-    embed: (inputs: string[]) => Promise<number[][]>,
+    embed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]>,
     onProgress: (snapshot: IndexSnapshot) => void = () => undefined,
+    queryEmbed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]> = embed,
+    validateModel: (model: EmbeddingModel) => Promise<boolean> = async () => true,
   ) {
     this.adapter = adapter;
     this.root = root;
     this.listSources = listSources;
     this.embed = embed;
     this.onProgress = onProgress;
+    this.queryEmbed = queryEmbed;
+    this.validateModel = validateModel;
   }
 
   cancel(): void {
@@ -450,12 +484,142 @@ export class MarkdownIndex {
     return { ...this.snapshot, statuses: { ...this.snapshot.statuses } };
   }
 
+  async retrieve(question: string): Promise<RetrievedEvidence[]> {
+    const active = this.active;
+    if (this.snapshot.phase !== "ready" || !active || question.trim().length === 0) {
+      return [];
+    }
+    const dimension = active.catalog.signature.vectorDimension;
+    if (dimension === 0) return [];
+    const queryVectors = await this.queryEmbed([question], active.model);
+    const query = queryVectors[0];
+    if (!query || query.length !== dimension || query.some((value) => !Number.isFinite(value))) {
+      throw new TypeError("invalid_query_embedding");
+    }
+    if (queryVectors.length !== 1) throw new TypeError("invalid_query_embedding_count");
+
+    const ranked: { chunk: StoredChunk; entry: SourceEntry; score: number }[] = [];
+    let stale = false;
+    const generation = `${this.root}/generations/${active.catalog.generationId}`;
+    for (const entry of active.catalog.entries) {
+      if (entry.status !== "indexed" || !entry.record) continue;
+      const record = parseRecord(
+        await this.adapter.read(`${generation}/${entry.record}`).catch(() => ""),
+        entry,
+        dimension,
+      );
+      if (
+        !record ||
+        record.chunks.length !== entry.chunkCount ||
+        record.chunks.length !== entry.vectorCount ||
+        record.chunks.some(
+          (chunk, ordinal) =>
+            chunk.id !== `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
+        )
+      ) {
+        stale = true;
+        continue;
+      }
+      for (const chunk of record.chunks) {
+        const vector = decodeVector(chunk.vector, dimension);
+        let score = 0;
+        for (let index = 0; index < dimension; index += 1) {
+          score += (query[index] ?? 0) * (vector[index] ?? 0);
+        }
+        ranked.push({ chunk, entry, score });
+      }
+    }
+    ranked.sort(
+      (left, right) => right.score - left.score || left.chunk.id.localeCompare(right.chunk.id),
+    );
+
+    const sources = new Map(this.listSources().map((source) => [source.path, source]));
+    const evidence: RetrievedEvidence[] = [];
+    const queryId = ++this.querySequence;
+    for (const candidate of ranked) {
+      const source = sources.get(candidate.entry.path);
+      const hydrated = source
+        ? await this.hydrate(candidate.entry, candidate.chunk, candidate.score, source)
+        : null;
+      if (!hydrated) {
+        stale = true;
+        continue;
+      }
+      evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
+      if (evidence.length === 4) break;
+    }
+    if (stale) this.queueReplacement(active.model);
+    return evidence;
+  }
+
+  async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
+    const source = this.listSources().find(({ path }) => path === evidence.path);
+    if (!source) {
+      if (this.active) this.queueReplacement(this.active.model);
+      return null;
+    }
+    const entry: SourceEntry = {
+      fingerprint: evidence.fingerprint,
+      path: evidence.path,
+      sourceKey: evidence.chunkId.split(":", 1)[0] ?? "",
+      status: "indexed",
+    };
+    const chunk: StoredChunk = {
+      id: evidence.chunkId,
+      locator: locatorFor(evidence.path, evidence),
+      vector: "",
+    };
+    const hydrated = await this.hydrate(entry, chunk, evidence.score, source);
+    if (!hydrated && this.active) this.queueReplacement(this.active.model);
+    return hydrated ? { ...hydrated, citationId: evidence.citationId } : null;
+  }
+
+  private queueReplacement(model: EmbeddingModel): void {
+    if (this.replacementQueued) return;
+    this.replacementQueued = true;
+    void this.start(model).finally(() => {
+      this.replacementQueued = false;
+    });
+  }
+
+  private async hydrate(
+    entry: SourceEntry,
+    stored: StoredChunk,
+    score: number,
+    source: MarkdownSource,
+  ): Promise<Omit<RetrievedEvidence, "citationId"> | null> {
+    const prepared = await prepareSource(source);
+    if (
+      prepared.entry.status !== "indexed" ||
+      prepared.entry.fingerprint !== entry.fingerprint ||
+      prepared.entry.sourceKey !== entry.sourceKey
+    ) {
+      return null;
+    }
+    const chunk = prepared.chunks.find((item) => sameLocator(stored.locator, locatorFor(source.path, item)));
+    if (!chunk || !entry.fingerprint) return null;
+    return {
+      ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
+      chunkId: stored.id,
+      end: chunk.end,
+      endLine: chunk.endLine,
+      fingerprint: entry.fingerprint,
+      path: source.path,
+      score,
+      start: chunk.start,
+      startLine: chunk.startLine,
+      text: chunk.text,
+    };
+  }
+
   async start(model: EmbeddingModel): Promise<IndexSnapshot> {
     const revision = ++this.revision;
     if (!validModel(model)) return this.update({ completed: 0, phase: "failed", statuses: {}, total: 0 });
     const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
-    this.update({ completed: 0, phase: "indexing", statuses: {}, total: sources.length });
     try {
+      if (!(await this.validateModel(model))) throw new Error("embedding_model_unavailable");
+      this.assertCurrent(revision);
+      this.update({ completed: 0, phase: "indexing", statuses: {}, total: sources.length });
       const restored = await this.restore(model, sources, revision);
       if (restored) return restored;
       return await this.build(model, sources, revision);
@@ -527,6 +691,7 @@ export class MarkdownIndex {
         }
       }
     }
+    this.active = { catalog, model };
     return this.update({
       completed: sources.length,
       phase: "ready",
@@ -553,7 +718,7 @@ export class MarkdownIndex {
           const storedChunks: StoredChunk[] = [];
           for (let offset = 0; offset < prepared.chunks.length; offset += EMBEDDING_BATCH_SIZE) {
             const batch = prepared.chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
-            const vectors = await this.embed(batch.map((chunk) => chunk.text));
+            const vectors = await this.embed(batch.map((chunk) => chunk.text), model);
             this.assertCurrent(revision);
             if (vectors.length !== batch.length) throw new TypeError("invalid_embedding_vector_count");
             for (let index = 0; index < batch.length; index += 1) {
@@ -620,6 +785,7 @@ export class MarkdownIndex {
       }
       if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
       await this.adapter.process(activePath, () => JSON.stringify({ generationId }));
+      this.active = { catalog, model };
       const ready = this.update({
         completed: sources.length,
         phase: "ready",

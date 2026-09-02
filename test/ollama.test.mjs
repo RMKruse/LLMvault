@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { ReadableStream } from "node:stream/web";
 import test from "node:test";
+import { TextEncoder } from "node:util";
 
 import {
   OllamaClient,
@@ -13,6 +15,18 @@ const json = (value, init) =>
     headers: { "content-type": "application/json" },
     ...init,
   });
+
+const ndjson = (...chunks) =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    }),
+    { headers: { "content-type": "application/x-ndjson" } },
+  );
 
 test("discovery exposes only compatible local models through the fixed API", async () => {
   const requests = [];
@@ -151,6 +165,59 @@ test("selection reconciliation never auto-selects and precisely clears stale cho
   );
 });
 
+test("pinned model validation inspects only the selected local digest", async () => {
+  const paths = [];
+  let selectedRemote = false;
+  const client = new OllamaClient(async (input, init) => {
+    const url = new URL(input);
+    paths.push(url.pathname);
+    if (url.pathname === "/api/tags") {
+      return json({
+        models: [
+          {
+            model: "selected",
+            digest: "sha256:selected",
+            ...(selectedRemote ? { remote_model: "cloud/selected" } : {}),
+          },
+          { model: "unrelated", digest: "sha256:unrelated" },
+        ],
+      });
+    }
+    assert.equal(JSON.parse(init.body).model, "selected");
+    return json({ capabilities: ["embedding"] });
+  });
+
+  assert.equal(
+    await client.validatePinnedModel(
+      11434,
+      "selected",
+      "sha256:selected",
+      "embedding",
+    ),
+    "compatible",
+  );
+  assert.deepEqual(paths, ["/api/tags", "/api/show"]);
+  assert.equal(
+    await client.validatePinnedModel(
+      11434,
+      "selected",
+      "sha256:changed",
+      "embedding",
+    ),
+    "incompatible",
+  );
+  selectedRemote = true;
+  assert.equal(
+    await client.validatePinnedModel(
+      11434,
+      "selected",
+      "sha256:changed",
+      "embedding",
+    ),
+    "remote",
+  );
+});
+
 test("metadata parsing is bounded and reports stable response errors", async () => {
   const oversized = new Uint8Array(2 * 1024 * 1024 + 1);
   const client = new OllamaClient(async () => new Response(oversized));
@@ -211,5 +278,101 @@ test("embedding batches preserve order, disable truncation, and validate every v
   await assert.rejects(
     inconsistent.embed(11434, "embed", ["first", "second"]),
     (error) => error instanceof OllamaError && error.code === "invalid_response",
+  );
+});
+
+test("chat streams only answer content from strict NDJSON and requires done", async () => {
+  let request;
+  const client = new OllamaClient(async (input, init) => {
+    request = { input: String(input), init };
+    return ndjson(
+      '{"message":{"content":"Grounded ","thinking":"hidden"},"done":false}\n',
+      '{"message":{"con',
+      'tent":"answer [S1]"},"done":false}\n{"message":{"content":""},"done":true,"done_reason":"stop"}\n',
+    );
+  });
+  const messages = [
+    { role: "system", content: "Use evidence only." },
+    { role: "user", content: "Question and evidence" },
+  ];
+  const chunks = [];
+
+  const result = await client.chat(11434, "chat", messages, (chunk) => chunks.push(chunk));
+
+  assert.equal(request.input, "http://127.0.0.1:11434/api/chat");
+  assert.deepEqual(JSON.parse(request.init.body), {
+    model: "chat",
+    messages,
+    stream: true,
+  });
+  assert.deepEqual(chunks, ["Grounded ", "answer [S1]"]);
+  assert.deepEqual(result, {
+    content: "Grounded answer [S1]",
+    diagnostics: { done_reason: "stop" },
+  });
+
+  for (const response of [
+    ndjson('{"message":{"content":"partial"},"done":false}\n'),
+    ndjson("not-json\n"),
+    ndjson('{"error":"model failed"}\n'),
+  ]) {
+    const invalid = new OllamaClient(async () => response);
+    await assert.rejects(
+      invalid.chat(11434, "chat", messages, () => undefined),
+      (error) =>
+        error instanceof OllamaError &&
+        ["invalid_response", "stream_interrupted"].includes(error.code),
+    );
+  }
+});
+
+test("non-stream chat uses the same terminal contract and retains diagnostics", async () => {
+  const chunks = [];
+  const client = new OllamaClient(async (_input, init) => {
+    assert.equal(JSON.parse(init.body).stream, false);
+    return json({
+      message: { content: "One complete answer" },
+      done: true,
+      done_reason: "stop",
+      total_duration: 42,
+      eval_count: 7,
+    });
+  });
+
+  const result = await client.chat(
+    11434,
+    "chat",
+    [{ role: "user", content: "Question" }],
+    (chunk) => chunks.push(chunk),
+    false,
+  );
+
+  assert.deepEqual(chunks, ["One complete answer"]);
+  assert.deepEqual(result, {
+    content: "One complete answer",
+    diagnostics: {
+      done_reason: "stop",
+      eval_count: 7,
+      total_duration: 42,
+    },
+  });
+});
+
+test("chat retains bounded Ollama HTTP error detail", async () => {
+  const client = new OllamaClient(async () =>
+    json({ error: "context is too long" }, { status: 400 }),
+  );
+
+  await assert.rejects(
+    client.chat(
+      11434,
+      "chat",
+      [{ role: "user", content: "Question" }],
+      () => undefined,
+    ),
+    (error) =>
+      error instanceof OllamaError &&
+      error.code === "invalid_request" &&
+      error.detail === "context is too long",
   );
 });
