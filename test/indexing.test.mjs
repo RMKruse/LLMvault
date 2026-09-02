@@ -548,6 +548,71 @@ test("cancelled rebuild returns to the prior active generation", async () => {
   assert.equal((await index.retrieve("question"))[0]?.text, "current");
 });
 
+test("delete all drains active work and removes only the fixed index root", async () => {
+  const adapter = new PausingProcessAdapter();
+  const root = "plugin/index-v1";
+  const model = { name: "embed", digest: "sha256:abc" };
+  const index = new VaultIndex(
+    adapter,
+    root,
+    () => [{ path: "Note.md", read: async () => "current" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start(model);
+  await adapter.write("plugin/connection-settings.json", "keep");
+  adapter.pauseCommit = true;
+  const rebuilding = index.rebuild(model);
+  await adapter.commitStarted;
+
+  const deleting = index.deleteAll();
+  assert.deepEqual(await index.retrieve("question"), []);
+  const blockedStart = index.start(model);
+  adapter.pauseCommit = false;
+  adapter.releaseCommit();
+  await Promise.all([rebuilding, deleting, blockedStart]);
+
+  assert.equal([...adapter.files.keys()].some((path) => path.startsWith(`${root}/`)), false);
+  assert.equal([...adapter.folders].some((path) => path === root || path.startsWith(`${root}/`)), false);
+  assert.equal(await adapter.read("plugin/connection-settings.json"), "keep");
+  assert.deepEqual(index.getSnapshot(), {
+    available: false,
+    completed: 0,
+    outcomes: [],
+    phase: "idle",
+    statuses: {},
+    total: 0,
+  });
+});
+
+test("failed index deletion stays visible and can be retried", async () => {
+  const root = "plugin/index-v1";
+  const adapter = new class extends MemoryAdapter {
+    failRemoval = true;
+
+    async rmdir(path) {
+      if (path === root && this.failRemoval) {
+        this.failRemoval = false;
+        throw new Error("storage busy");
+      }
+      await super.rmdir(path);
+    }
+  }();
+  const index = new VaultIndex(
+    adapter,
+    root,
+    () => [{ path: "Note.md", read: async () => "current" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+
+  await assert.rejects(index.deleteAll(), /storage busy/);
+  assert.equal(index.getSnapshot().phase, "failed");
+  await index.deleteAll();
+
+  assert.equal(await adapter.exists(root), false);
+  assert.equal(index.getSnapshot().phase, "idle");
+});
+
 test("Vault mutations tombstone immediately and serialize to the clean final index", async () => {
   const adapter = new MemoryAdapter();
   let text = "original";

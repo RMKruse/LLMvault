@@ -25,6 +25,12 @@ test("build produces an installable desktop Vault Chat plugin", async () => {
   assert.match(bundle, /Local conversations/);
   assert.match(bundle, /New conversation/);
   assert.match(bundle, /Delete conversation/);
+  assert.match(bundle, /Delete all Vault Chat data/);
+  assert.match(bundle, /External backups, sync history, SSD behavior, OS state, and Ollama logs/);
+  assert.match(bundle, /Deletion complete/);
+  assert.match(bundle, /Deletion incomplete/);
+  assert.match(bundle, /Deletion canceled/);
+  assert.match(bundle, /vaultChatStopped/);
   assert.match(styles, /\.llmvault-chat/);
   assert.match(styles, /\.llmvault-chat__citation/);
   assert.match(styles, /\.llmvault-chat__history/);

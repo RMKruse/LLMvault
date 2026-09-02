@@ -71,6 +71,7 @@ class VaultChatView extends ItemView {
   private chatModel: string | null;
   private readonly citationRegistry = new Map<string, RetrievedEvidence>();
   private conversationTitleEl?: HTMLElement;
+  private deletionState: "idle" | "deleting" | "complete" | "failed" | "canceled" = "idle";
   private discovery: OllamaDiscovery | null = null;
   private displayGeneration = 0;
   private embeddingModel: string | null;
@@ -97,6 +98,8 @@ class VaultChatView extends ItemView {
     this.portValue = String(settings.ollamaPort);
     this.chatModel = settings.chatModel;
     this.embeddingModel = settings.embeddingModel;
+    if (plugin.isStopped()) this.status = "Vault Chat is stopped. Connection settings are retained.";
+    if (plugin.isDeletionIncomplete()) this.deletionState = "failed";
   }
 
   getViewType(): string {
@@ -115,12 +118,22 @@ class VaultChatView extends ItemView {
     this.renderShell();
     this.indexUnsubscribe = this.plugin.subscribeIndex((snapshot) => {
       this.renderIndex();
+      if (this.plugin.isStopped()) {
+        this.requestGeneration += 1;
+        this.displayGeneration += 1;
+        this.answering = false;
+        this.historyOpen = false;
+        this.historyEl?.empty();
+        this.clearConversation();
+        this.renderComposerState(snapshot);
+        return;
+      }
       if (snapshot.available && !this.answering) void this.renderSelectedConversation();
     });
     this.mutationUnsubscribe = this.plugin.subscribeMutations((paths) => {
       this.vaultContentChanged(paths);
     });
-    void this.refreshModels();
+    if (!this.plugin.isStopped()) void this.refreshModels();
     return Promise.resolve();
   }
 
@@ -822,6 +835,83 @@ class VaultChatView extends ItemView {
       updateCompleteButton();
     };
     complete.onclick = () => void this.completeSetup();
+
+    const deletion = setup.createDiv({ cls: "llmvault-chat__deletion" });
+    deletion.createEl("h4", { text: "Stop and delete Vault Chat data" });
+    deletion.createEl("p", {
+      text: "Deletes indexes, conversations, statuses, caches, temporary records, and in-memory work. Vault Content, Ollama models, and retained connection settings are not changed.",
+    });
+    deletion.createEl("p", {
+      cls: "llmvault-chat__disclosure",
+      text: "This is not secure erasure. External backups, sync history, SSD behavior, OS state, and Ollama logs are outside this plugin's control.",
+    });
+    const deletionMessage = {
+      canceled: "Deletion canceled. Data and active work were not changed.",
+      complete: "Deletion complete. Vault Chat is stopped and plugin-owned content data was removed.",
+      deleting: "Deleting plugin-owned Vault Chat data…",
+      failed: "Deletion incomplete. Vault Chat remains stopped. Retry to remove any plugin-owned data that remains.",
+      idle: "",
+    }[this.deletionState];
+    if (deletionMessage) {
+      deletion.createEl("p", {
+        attr: { "aria-live": "polite", role: "status" },
+        text: deletionMessage,
+      });
+    }
+    if (this.deletionState === "deleting") {
+      const deleting = deletion.createEl("button", { attr: { type: "button" }, text: "Deleting…" });
+      deleting.disabled = true;
+    } else {
+      const remove = deletion.createEl("button", {
+        cls: "mod-warning",
+        attr: { type: "button" },
+        text: this.deletionState === "failed"
+          ? "Retry delete all Vault Chat data"
+          : "Delete all Vault Chat data",
+      });
+      remove.onclick = () => {
+        if (!window.confirm(
+          "Delete all Vault Chat data? Vault Chat work will stop before plugin-owned data is removed. Vault Content, Ollama models, and retained connection settings will not change.",
+        )) {
+          this.deletionState = "canceled";
+          this.renderSetup();
+          return;
+        }
+        void this.deleteAllData();
+      };
+    }
+  }
+
+  private async deleteAllData(): Promise<void> {
+    this.requestGeneration += 1;
+    this.displayGeneration += 1;
+    this.deletionState = "deleting";
+    this.busy = true;
+    this.answering = false;
+    this.historyOpen = false;
+    this.historyEl?.empty();
+    this.clearConversation();
+    this.renderSetup();
+    this.renderComposerState();
+    try {
+      await this.plugin.deleteAllData();
+      const settings = this.plugin.getSettings();
+      this.portValue = String(settings.ollamaPort);
+      this.chatModel = settings.chatModel;
+      this.embeddingModel = settings.embeddingModel;
+      this.discovery = null;
+      this.historyStatus = "";
+      this.status = "Vault Chat is stopped. Connection settings are retained.";
+      this.clearConversation();
+      this.renderHistory();
+      this.deletionState = "complete";
+    } catch {
+      this.deletionState = "failed";
+    } finally {
+      this.busy = false;
+      this.renderSetup();
+      this.renderIndex();
+    }
   }
 
   private createModelSelect(
@@ -962,7 +1052,7 @@ class VaultChatView extends ItemView {
 
       await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel });
       this.status = "Setup complete. Both Local Models are compatible; indexing is starting.";
-      void this.plugin.startIndexing(this.discovery, embeddingModel);
+      await this.plugin.resumeVaultChat(this.discovery, embeddingModel);
     } catch (error) {
       if (requestGeneration !== this.requestGeneration) return;
       this.status = this.errorMessage(error);
@@ -1016,6 +1106,8 @@ export default class LLMvaultPlugin extends Plugin {
     selectedConversationId: null,
   };
   private dataWrite: Promise<void> = Promise.resolve();
+  private deletionPending = false;
+  private deleteOperation?: Promise<void>;
   private index?: VaultIndex;
   private indexSnapshot: IndexSnapshot = {
     available: false,
@@ -1032,11 +1124,16 @@ export default class LLMvaultPlugin extends Plugin {
   private readonly ollama = new OllamaClient();
   private readonly queryOllama = new OllamaClient();
   private llmvaultSettings = normalizeSettings(null);
+  private stopped = false;
 
   override async onload(): Promise<void> {
     const data: unknown = await this.loadData();
     this.llmvaultSettings = normalizeSettings(data);
     this.conversationState = normalizeConversationState(data);
+    this.deletionPending = typeof data === "object" && data !== null &&
+      "vaultChatDeletionPending" in data && data.vaultChatDeletionPending === true;
+    this.stopped = this.deletionPending || (typeof data === "object" && data !== null &&
+      "vaultChatStopped" in data && data.vaultChatStopped === true);
     const pluginDirectory = this.manifest.dir;
     if (pluginDirectory) {
       this.index = new VaultIndex(
@@ -1117,6 +1214,14 @@ export default class LLMvaultPlugin extends Plugin {
     return { ...this.llmvaultSettings };
   }
 
+  isStopped(): boolean {
+    return this.stopped;
+  }
+
+  isDeletionIncomplete(): boolean {
+    return this.deletionPending;
+  }
+
   async saveSettings(settings: LLMvaultSettings): Promise<void> {
     const normalized = normalizeSettings(settings);
     await this.updateData(() => {
@@ -1138,6 +1243,7 @@ export default class LLMvaultPlugin extends Plugin {
     conversationId: string | null,
     turn: Omit<CompletedTurn, "completedAt" | "status">,
   ): Promise<void> {
+    this.requireRunning();
     const completed: CompletedTurn = {
       ...turn,
       completedAt: Date.now(),
@@ -1155,6 +1261,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async startNewConversation(): Promise<void> {
+    this.requireRunning();
     this.abortAnswerRequests();
     await this.updateData(() => {
       this.conversationState = newConversation(this.conversationState);
@@ -1162,6 +1269,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async selectConversation(id: string): Promise<void> {
+    this.requireRunning();
     this.abortAnswerRequests();
     await this.updateData(() => {
       this.conversationState = selectConversation(this.conversationState, id);
@@ -1169,6 +1277,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async deleteConversation(id: string): Promise<void> {
+    this.requireRunning();
     if (this.conversationState.selectedConversationId === id) this.abortAnswerRequests();
     await this.updateData(() => {
       this.conversationState = deleteConversation(this.conversationState, id);
@@ -1197,6 +1306,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   retrieve(question: string): Promise<RetrievedEvidence[]> {
+    if (this.stopped) return Promise.resolve([]);
     return this.index?.retrieve(question) ?? Promise.resolve([]);
   }
 
@@ -1204,6 +1314,7 @@ export default class LLMvaultPlugin extends Plugin {
     messages: OllamaMessage[],
     onContent: (content: string) => void,
   ): Promise<OllamaChatResult> {
+    this.requireRunning();
     const settings = this.getSettings();
     if (!settings.chatModel) {
       throw new OllamaError("chat_model_unavailable", "/api/chat");
@@ -1217,6 +1328,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async validateChatModel(): Promise<void> {
+    this.requireRunning();
     const settings = this.getSettings();
     if (!settings.chatModel) {
       throw new OllamaError("chat_model_unavailable", "/api/show");
@@ -1237,6 +1349,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
+    if (this.stopped) return null;
     const current = await (this.index?.resolveEvidence(evidence) ?? Promise.resolve(null));
     return current && this.evidenceFile(current) ? current : null;
   }
@@ -1270,15 +1383,21 @@ export default class LLMvaultPlugin extends Plugin {
     const operation = this.dataWrite.then(async () => {
       const priorSettings = this.llmvaultSettings;
       const priorConversations = this.conversationState;
+      const priorDeletionPending = this.deletionPending;
+      const priorStopped = this.stopped;
       update();
       try {
         await this.saveData({
           ...this.llmvaultSettings,
           ...this.conversationState,
+          vaultChatDeletionPending: this.deletionPending,
+          vaultChatStopped: this.stopped,
         });
       } catch (error) {
         this.llmvaultSettings = priorSettings;
         this.conversationState = priorConversations;
+        this.deletionPending = priorDeletionPending;
+        this.stopped = priorStopped;
         throw error;
       }
     });
@@ -1313,6 +1432,7 @@ export default class LLMvaultPlugin extends Plugin {
     embeddingModel: string,
     rebuild = false,
   ): Promise<void> {
+    if (this.stopped) return;
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
       this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
@@ -1327,6 +1447,42 @@ export default class LLMvaultPlugin extends Plugin {
 
   async rebuildIndex(): Promise<void> {
     await this.restoreIndex(true);
+  }
+
+  async resumeVaultChat(
+    discovery: OllamaDiscovery,
+    embeddingModel: string,
+  ): Promise<void> {
+    if (this.deleteOperation) throw new Error("vault_chat_deletion_in_progress");
+    if (this.deletionPending) throw new Error("vault_chat_deletion_incomplete");
+    if (this.stopped) {
+      await this.updateData(() => { this.stopped = false; });
+    }
+    void this.startIndexing(discovery, embeddingModel);
+  }
+
+  deleteAllData(): Promise<void> {
+    if (this.deleteOperation) return this.deleteOperation;
+    this.stopped = true;
+    this.deletionPending = true;
+    this.index?.cancel();
+    this.indexOllama.abortAll();
+    this.chatOllama.abortAll();
+    this.ollama.abortAll();
+    this.queryOllama.abortAll();
+    const operation = (async () => {
+      await this.updateData(() => {
+        this.conversationState = { conversations: [], selectedConversationId: null };
+      });
+      await this.index?.deleteAll();
+      await this.updateData(() => { this.deletionPending = false; });
+    })();
+    this.deleteOperation = operation;
+    operation.then(
+      () => { if (this.deleteOperation === operation) this.deleteOperation = undefined; },
+      () => { if (this.deleteOperation === operation) this.deleteOperation = undefined; },
+    );
+    return operation;
   }
 
   private vaultSources(): VaultSource[] {
@@ -1361,6 +1517,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   private handleVaultMutation(file: TAbstractFile, oldPath?: string): void {
+    if (this.stopped) return;
     if (!(file instanceof TFile)) return;
     const paths = new Set(
       [oldPath, file.path].filter(
@@ -1390,6 +1547,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   private async restoreIndex(rebuild = false): Promise<void> {
+    if (this.stopped) return;
     const settings = this.getSettings();
     if (!settings.embeddingModel) return;
     try {
@@ -1411,5 +1569,9 @@ export default class LLMvaultPlugin extends Plugin {
 
     await leaf.setViewState({ active: true, type: VIEW_TYPE_VAULT_CHAT });
     await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private requireRunning(): void {
+    if (this.stopped || this.deleteOperation) throw new Error("vault_chat_stopped");
   }
 }

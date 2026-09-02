@@ -811,6 +811,7 @@ function sameLocator(left: StoredLocator, right: StoredLocator): boolean {
 export class VaultIndex {
   private active?: { catalog: Catalog; model: EmbeddingModel };
   private readonly adapter: IndexAdapter;
+  private deleteOperation?: Promise<void>;
   private drain?: Promise<IndexSnapshot>;
   private readonly embed: (
     inputs: string[],
@@ -864,6 +865,34 @@ export class VaultIndex {
       statuses: statusCounts(entries),
       total: entries.length,
     });
+  }
+
+  deleteAll(): Promise<void> {
+    if (this.deleteOperation) return this.deleteOperation;
+    this.revision += 1;
+    this.rebuildQueued = false;
+    this.forceRebuild = false;
+    this.pendingPaths.clear();
+    this.active = undefined;
+    this.model = undefined;
+    this.update({ available: false, completed: 0, outcomes: [], phase: "indexing", statuses: {}, total: 0 });
+    const drain = this.drain;
+    const operation = (async () => {
+      try {
+        await drain;
+        if (await this.adapter.exists(this.root)) await this.adapter.rmdir(this.root, true);
+        this.update({ available: false, completed: 0, outcomes: [], phase: "idle", statuses: {}, total: 0 });
+      } catch (error) {
+        this.update({ available: false, completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
+        throw error;
+      }
+    })();
+    this.deleteOperation = operation;
+    operation.then(
+      () => { if (this.deleteOperation === operation) this.deleteOperation = undefined; },
+      () => { if (this.deleteOperation === operation) this.deleteOperation = undefined; },
+    );
+    return operation;
   }
 
   getSnapshot(): IndexSnapshot {
@@ -972,6 +1001,7 @@ export class VaultIndex {
 
   // ponytail: rebuild the whole generation; go per-source only if change latency becomes material.
   invalidate(paths: Iterable<string>): Promise<IndexSnapshot> {
+    if (this.deleteOperation) return this.deleteOperation.then(() => this.getSnapshot());
     for (const path of paths) {
       if (path) this.pendingPaths.add(path);
     }
@@ -1048,6 +1078,7 @@ export class VaultIndex {
   }
 
   start(model: EmbeddingModel): Promise<IndexSnapshot> {
+    if (this.deleteOperation) return this.deleteOperation.then(() => this.getSnapshot());
     this.model = model;
     this.rebuildQueued = true;
     this.revision += 1;
@@ -1058,6 +1089,7 @@ export class VaultIndex {
   }
 
   rebuild(model: EmbeddingModel): Promise<IndexSnapshot> {
+    if (this.deleteOperation) return this.deleteOperation.then(() => this.getSnapshot());
     this.forceRebuild = true;
     return this.start(model);
   }
