@@ -310,7 +310,7 @@ export class OllamaClient {
   private readonly controllers = new Set<AbortController>();
   private readonly fetcher: Fetcher;
 
-  constructor(fetcher: Fetcher = fetch) {
+  constructor(fetcher: Fetcher = globalThis.fetch.bind(globalThis)) {
     this.fetcher = fetcher;
   }
 

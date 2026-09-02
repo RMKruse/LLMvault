@@ -6,3 +6,4 @@ node_modules/
 main.js
 *.map
 evaluation/results/in-progress.json
+evaluation/results/acceptance.json

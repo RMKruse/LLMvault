@@ -158,6 +158,12 @@ interface SourceRecord {
   vectorDimension: number;
 }
 
+interface ValidatedGeneration {
+  catalog: Catalog;
+  records: Map<string, SourceRecord>;
+  vectors: Map<string, Float32Array>;
+}
+
 interface PreparedSource {
   chunks: PreparedChunk[];
   entry: SourceEntry;
@@ -811,7 +817,7 @@ function sameLocator(left: StoredLocator, right: StoredLocator): boolean {
 }
 
 export class VaultIndex {
-  private active?: { catalog: Catalog; model: EmbeddingModel };
+  private active?: ValidatedGeneration & { model: EmbeddingModel };
   private readonly adapter: IndexAdapter;
   private deleteOperation?: Promise<void>;
   private drain?: Promise<IndexSnapshot>;
@@ -930,14 +936,9 @@ export class VaultIndex {
 
     const ranked: { chunk: StoredChunk; entry: SourceEntry; score: number }[] = [];
     let stale = false;
-    const generation = `${this.root}/generations/${active.catalog.generationId}`;
     for (const entry of active.catalog.entries) {
       if (entry.status !== "indexed" || !entry.record) continue;
-      const record = parseRecord(
-        await this.adapter.read(`${generation}/${entry.record}`).catch(() => ""),
-        entry,
-        dimension,
-      );
+      const record = active.records.get(entry.record);
       if (revision !== this.revision) return [];
       if (
         !record ||
@@ -952,7 +953,11 @@ export class VaultIndex {
         continue;
       }
       for (const chunk of record.chunks) {
-        const vector = decodeVector(chunk.vector, dimension);
+        const vector = active.vectors.get(chunk.id);
+        if (!vector) {
+          stale = true;
+          continue;
+        }
         let score = 0;
         for (let index = 0; index < dimension; index += 1) {
           score += (query[index] ?? 0) * (vector[index] ?? 0);
@@ -1114,10 +1119,11 @@ export class VaultIndex {
         let result = this.getSnapshot();
         while (this.rebuildQueued && this.model) {
           this.rebuildQueued = false;
+          const replacementPaths = new Set(this.pendingPaths);
           this.pendingPaths.clear();
           const force = this.forceRebuild;
           this.forceRebuild = false;
-          result = await this.run(this.model, this.revision, force);
+          result = await this.run(this.model, this.revision, force, replacementPaths);
         }
         return result;
       })
@@ -1127,7 +1133,12 @@ export class VaultIndex {
     return this.drain;
   }
 
-  private async run(model: EmbeddingModel, revision: number, force: boolean): Promise<IndexSnapshot> {
+  private async run(
+    model: EmbeddingModel,
+    revision: number,
+    force: boolean,
+    replacementPaths: Set<string>,
+  ): Promise<IndexSnapshot> {
     if (!validModel(model)) {
       const entries = this.active?.catalog.entries ?? [];
       return this.update({ available: Boolean(this.active), completed: 0, outcomes: outcomes(entries), phase: "failed", statuses: statusCounts(entries), total: 0 });
@@ -1142,7 +1153,7 @@ export class VaultIndex {
         if (restored) return restored;
       }
       if (!this.active) await this.cleanupGenerations();
-      return await this.build(model, sources, revision);
+      return await this.build(model, sources, revision, replacementPaths);
     } catch {
       if (revision !== this.revision) return this.getSnapshot();
       const entries = this.active?.catalog.entries ?? [];
@@ -1183,12 +1194,14 @@ export class VaultIndex {
   private async validateGeneration(
     generationId: string,
     model: EmbeddingModel,
-  ): Promise<Catalog | null> {
+  ): Promise<ValidatedGeneration | null> {
     try {
       const generation = `${this.root}/generations/${generationId}`;
       const catalog = parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model);
       if (!catalog || catalog.generationId !== generationId) return null;
       const paths = new Set<string>();
+      const records = new Map<string, SourceRecord>();
+      const vectors = new Map<string, Float32Array>();
       for (const entry of catalog.entries) {
         if (paths.has(entry.path)) return null;
         paths.add(entry.path);
@@ -1210,8 +1223,12 @@ export class VaultIndex {
         if (!record || record.chunks.length !== entry.chunkCount || record.chunks.some(
           (chunk, ordinal) => chunk.id !== `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
         )) return null;
+        records.set(recordName, record);
+        for (const chunk of record.chunks) {
+          vectors.set(chunk.id, decodeVector(chunk.vector, catalog.signature.vectorDimension));
+        }
       }
-      return catalog;
+      return { catalog, records, vectors };
     } catch {
       return null;
     }
@@ -1231,9 +1248,9 @@ export class VaultIndex {
       return null;
     }
     if (!isRecord(active) || !isGenerationId(active.generationId)) return null;
-    const generation = `${this.root}/generations/${active.generationId}`;
-    const catalog = await this.validateGeneration(active.generationId, model);
-    if (!catalog) return null;
+    const validated = await this.validateGeneration(active.generationId, model);
+    if (!validated) return null;
+    const { catalog } = validated;
     const entriesByPath = new Map(catalog.entries.map((entry) => [entry.path, entry]));
     const reusable: SourceEntry[] = [];
     for (const source of sources) {
@@ -1243,11 +1260,7 @@ export class VaultIndex {
       if (!expected || !exactSourceMatch(prepared.entry, expected)) continue;
       if (expected.status === "indexed") {
         const recordName = `records/${expected.sourceKey}-${expected.fingerprint}.json`;
-        const record = parseRecord(
-          await this.adapter.read(`${generation}/${recordName}`),
-          expected,
-          catalog.signature.vectorDimension,
-        );
+        const record = validated.records.get(recordName);
         if (!record || record.chunks.length !== prepared.chunks.length ||
           record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
         let locatorsMatch = true;
@@ -1266,7 +1279,7 @@ export class VaultIndex {
     }
     this.assertCurrent(revision);
     const currentCatalog = { ...catalog, entries: reusable };
-    this.active = { catalog: currentCatalog, model };
+    this.active = { ...validated, catalog: currentCatalog, model };
     if (reusable.length !== sources.length || catalog.entries.length !== sources.length) {
       this.update({
         available: true,
@@ -1293,65 +1306,73 @@ export class VaultIndex {
     model: EmbeddingModel,
     sources: VaultSource[],
     revision: number,
+    replacementPaths: Set<string>,
   ): Promise<IndexSnapshot> {
     const generationId = globalThis.crypto.randomUUID();
     const generation = await this.ensureDirectories(generationId);
     const entries: SourceEntry[] = [];
+    const records = new Map<string, SourceRecord>();
+    const vectors = new Map<string, Float32Array>();
     let catalogCommitted = false;
     const reusable = compatibleSignature(this.active?.catalog.signature, model)
       ? new Map(this.active?.catalog.entries.map((entry) => [entry.path, entry]))
       : new Map<string, SourceEntry>();
-    const reusableGeneration = this.active
-      ? `${this.root}/generations/${this.active.catalog.generationId}`
-      : "";
     let vectorDimension = this.active && reusable.size > 0
       ? this.active.catalog.signature.vectorDimension
       : 0;
     try {
-      for (const source of sources) {
+      const orderedSources = [
+        ...sources.filter(({ path }) => !replacementPaths.has(path)),
+        ...sources.filter(({ path }) => replacementPaths.has(path)),
+      ];
+      for (const source of orderedSources) {
         this.assertCurrent(revision);
         const prepared = await prepareSource(source);
         const entry = prepared.entry;
         const previous = reusable.get(entry.path);
         let reused = previous !== undefined && exactSourceMatch(entry, previous);
         if (reused && entry.status === "indexed" && previous?.record) {
-          const serializedRecord = await this.adapter.read(
-            `${reusableGeneration}/${previous.record}`,
-          ).catch(() => "");
-          const record = parseRecord(serializedRecord, previous, vectorDimension);
+          const record = this.active?.records.get(previous.record);
           reused = Boolean(record) && record?.chunks.length === prepared.chunks.length &&
             record.chunks.every((chunk, ordinal) => {
               const current = prepared.chunks[ordinal];
               return current !== undefined && sameLocator(chunk.locator, locatorFor(source.path, current));
             });
-          if (reused) {
+          if (reused && record) {
             entry.chunkCount = previous.chunkCount;
             entry.record = previous.record;
             entry.vectorCount = previous.vectorCount;
-            await this.adapter.write(`${generation}/${previous.record}`, serializedRecord);
+            await this.adapter.write(`${generation}/${previous.record}`, JSON.stringify(record));
+            records.set(previous.record, record);
+            for (const chunk of record.chunks) {
+              const vector = this.active?.vectors.get(chunk.id);
+              if (vector) vectors.set(chunk.id, vector);
+            }
           }
         }
         if (!reused && entry.status === "indexed") {
           const storedChunks: StoredChunk[] = [];
           for (let offset = 0; offset < prepared.chunks.length; offset += EMBEDDING_BATCH_SIZE) {
             const batch = prepared.chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
-            const vectors = await this.embed(batch.map((chunk) => chunk.text), model);
+            const embedded = await this.embed(batch.map((chunk) => chunk.text), model);
             this.assertCurrent(revision);
-            if (vectors.length !== batch.length) throw new TypeError("invalid_embedding_vector_count");
+            if (embedded.length !== batch.length) throw new TypeError("invalid_embedding_vector_count");
             for (let index = 0; index < batch.length; index += 1) {
               const chunk = batch[index];
-              const vector = vectors[index];
+              const vector = embedded[index];
               if (!chunk || !vector || vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
                 throw new TypeError("invalid_embedding_vector");
               }
               vectorDimension ||= vector.length;
               if (vector.length !== vectorDimension) throw new TypeError("inconsistent_embedding_dimension");
               const ordinal = offset + index;
+              const id = `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`;
               storedChunks.push({
-                id: `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
+                id,
                 locator: locatorFor(source.path, chunk),
                 vector: encodeVector(vector),
               });
+              vectors.set(id, Float32Array.from(vector));
             }
           }
           const recordName = `records/${entry.sourceKey}-${entry.fingerprint}.json`;
@@ -1361,12 +1382,14 @@ export class VaultIndex {
             sourceKey: entry.sourceKey,
             vectorDimension,
           };
-          await this.adapter.write(`${generation}/${recordName}`, JSON.stringify(record));
-          const validated = parseRecord(await this.adapter.read(`${generation}/${recordName}`), entry, vectorDimension);
-          if (!validated) throw new TypeError("invalid_persisted_record");
           entry.chunkCount = storedChunks.length;
           entry.record = recordName;
           entry.vectorCount = storedChunks.length;
+          records.set(recordName, record);
+          await this.adapter.write(`${generation}/${recordName}`, JSON.stringify(record));
+          const validated = parseRecord(await this.adapter.read(`${generation}/${recordName}`), entry, vectorDimension);
+          if (!validated) throw new TypeError("invalid_persisted_record");
+          records.set(recordName, validated);
         }
         entries.push(entry);
         this.update({
@@ -1388,8 +1411,8 @@ export class VaultIndex {
         signature: signatureFor(model, vectorDimension),
       };
       await this.adapter.write(`${generation}/catalog.json`, JSON.stringify(catalog));
-      const validatedCatalog = await this.validateGeneration(generationId, model);
-      if (!validatedCatalog) throw new TypeError("invalid_persisted_generation");
+      const validated = await this.validateGeneration(generationId, model);
+      if (!validated) throw new TypeError("invalid_persisted_generation");
 
       const activePath = `${this.root}/active.json`;
       if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
@@ -1400,7 +1423,7 @@ export class VaultIndex {
       });
       catalogCommitted = true;
       this.assertCurrent(revision);
-      this.active = { catalog: validatedCatalog, model };
+      this.active = { ...validated, model };
       const ready = this.update({
         available: true,
         completed: sources.length,

@@ -399,9 +399,12 @@ class VaultChatView extends ItemView {
         rebuild.disabled = snapshot.phase === "indexing";
         rebuild.onclick = () => void this.plugin.rebuildIndex();
       }
-      if (snapshot.outcomes.length > 0) {
-        const files = index.createEl("ul", { cls: "llmvault-chat__outcomes" });
-        for (const outcome of snapshot.outcomes) {
+      const issues = snapshot.outcomes.filter(({ status }) => status !== "indexed");
+      if (issues.length > 0) {
+        const details = index.createEl("details");
+        details.createEl("summary", { text: `File details (${String(issues.length)})` });
+        const files = details.createEl("ul");
+        for (const outcome of issues) {
           files.createEl("li", { text: `${outcome.path}: ${this.outcomeMessage(outcome)}` });
         }
       }
@@ -419,9 +422,8 @@ class VaultChatView extends ItemView {
         : `Index ready: ${snapshot.total} Vault Content files (${outcomes}).`;
     }
     if (snapshot.phase === "indexing") {
-      const current = snapshot.latestPath ? ` Current source: ${snapshot.latestPath}.` : "";
       const available = snapshot.available ? " Previous generation remains available." : "";
-      return `Indexing ${snapshot.completed} of ${snapshot.total} Vault Content files${outcomes ? ` (${outcomes})` : ""}.${available}${current}`;
+      return `Indexing ${snapshot.completed} of ${snapshot.total} Vault Content files${outcomes ? ` (${outcomes})` : ""}.${available}`;
     }
     if (snapshot.phase === "failed") {
       return snapshot.available
@@ -433,7 +435,6 @@ class VaultChatView extends ItemView {
 
   private outcomeMessage(outcome: IndexSnapshot["outcomes"][number]): string {
     const reason = "reason" in outcome ? outcome.reason?.replaceAll("_", " ") : undefined;
-    if (outcome.status === "indexed") return "indexed";
     if (outcome.status === "no_extractable_text") return `no extractable text (${reason}); add text, then rebuild`;
     if (outcome.status === "ignored_non_content") return `ignored non-content (${reason})`;
     if (outcome.status === "unsupported_format") return `unsupported format (${reason}); convert to Markdown or Canvas to index`;
@@ -648,6 +649,7 @@ class VaultChatView extends ItemView {
     this.unavailableCitations.clear();
     for (const citationId of unavailable) this.unavailableCitations.add(citationId);
     evidenceEl.empty();
+    evidenceEl.scrollTop = 0;
     evidenceEl.createEl("h3", { text: `Evidence used · ${evidence.length}` });
     if (evidence.length === 0) {
       evidenceEl.createEl("p", {

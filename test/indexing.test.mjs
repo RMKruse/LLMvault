@@ -490,6 +490,57 @@ test("a failed replacement keeps partial and prior stale chunks unqueryable", as
   assert.equal([...adapter.files.values()].some((value) => value.includes("replacement")), false);
 });
 
+test("queries scan the validated in-memory generation without record I/O", async () => {
+  const adapter = new class extends MemoryAdapter {
+    recordReads = 0;
+
+    async read(path) {
+      if (path.includes("/records/")) this.recordReads += 1;
+      return await super.read(path);
+    }
+  }();
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [{ path: "Note.md", read: async () => "current" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  adapter.recordReads = 0;
+
+  assert.equal((await index.retrieve("question"))[0]?.text, "current");
+  assert.equal(adapter.recordReads, 0);
+});
+
+test("mutation work leaves the changed source until after unchanged records are copied", async () => {
+  let mutation = false;
+  let mutationRecordWrites = 0;
+  const adapter = new class extends MemoryAdapter {
+    async write(path, value) {
+      if (mutation && path.includes("/records/")) mutationRecordWrites += 1;
+      await super.write(path, value);
+    }
+  }();
+  let changed = "before";
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [
+      { path: "Changed.md", read: async () => changed },
+      { path: "Stable.md", read: async () => "stable" },
+    ],
+    async (inputs) => {
+      if (mutation) assert.equal(mutationRecordWrites, 1);
+      return inputs.map(() => [1]);
+    },
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  changed = "after";
+  mutation = true;
+
+  await index.invalidate(["Changed.md"]);
+});
+
 test("manual rebuild keeps the prior generation available until atomic activation", async () => {
   const adapter = new PausingProcessAdapter();
   const model = { name: "embed", digest: "sha256:abc" };

@@ -28,6 +28,21 @@ const ndjson = (...chunks) =>
     { headers: { "content-type": "application/x-ndjson" } },
   );
 
+test("default fetch transport remains callable inside a browser host", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = function () {
+    assert.equal(this, globalThis);
+    return Promise.resolve(json({ version: "0.11.0" }));
+  };
+
+  try {
+    const client = new OllamaClient();
+    await client.transport(11434, "/api/version", undefined, new globalThis.AbortController().signal);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("discovery exposes only compatible local models through the fixed API", async () => {
   const requests = [];
   const details = {

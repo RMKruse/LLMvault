@@ -21,6 +21,8 @@ test("build produces an installable desktop Vault Chat plugin", async () => {
   assert.match(bundle, /Open source/);
   assert.match(bundle, /Stop/);
   assert.match(bundle, /Rebuild index/);
+  assert.doesNotMatch(bundle, /Current source:/);
+  assert.match(bundle, /File details/);
   assert.match(bundle, /Previous generation remains available/);
   assert.match(bundle, /Local conversations/);
   assert.match(bundle, /New conversation/);
@@ -34,4 +36,6 @@ test("build produces an installable desktop Vault Chat plugin", async () => {
   assert.match(styles, /\.llmvault-chat/);
   assert.match(styles, /\.llmvault-chat__citation/);
   assert.match(styles, /\.llmvault-chat__history/);
+  assert.match(styles, /"index"\s+"evidence"\s+"answer"/);
+  assert.match(styles, /grid-template-rows: auto auto auto 16rem 18rem minmax\(10rem, 1fr\) auto/);
 });

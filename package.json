@@ -9,12 +9,14 @@
     "build": "npm run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test:unit": "node --experimental-strip-types --test test/ollama.test.mjs test/indexing.test.mjs test/conversations.test.mjs test/plugin-data.test.mjs test/security.test.mjs test/quality.test.mjs",
+    "test:unit": "node --experimental-strip-types --test test/ollama.test.mjs test/indexing.test.mjs test/conversations.test.mjs test/plugin-data.test.mjs test/security.test.mjs test/quality.test.mjs test/acceptance.test.mjs",
     "test:smoke": "npm run build && node --test test/plugin-smoke.test.mjs",
     "test": "npm run test:unit && npm run test:smoke",
     "quality:manifest": "node evaluation/reference-vault-v1/build-manifest.mjs --check",
     "quality:calibrate": "node --experimental-strip-types evaluation/run.mjs --calibrate",
-    "quality:run": "npm run build && npm run quality:manifest && node --experimental-strip-types evaluation/run.mjs"
+    "quality:run": "npm run build && npm run quality:manifest && node --experimental-strip-types evaluation/run.mjs",
+    "acceptance:run": "npm run build && node --experimental-strip-types evaluation/acceptance.mjs --run",
+    "acceptance:check": "node evaluation/acceptance.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
