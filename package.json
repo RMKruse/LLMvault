@@ -2,6 +2,7 @@
   "name": "llmvault",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Local, vault-aware question answering for Obsidian",
   "type": "module",
   "scripts": {
@@ -16,15 +17,17 @@
     "quality:calibrate": "node --experimental-strip-types evaluation/run.mjs --calibrate",
     "quality:run": "npm run build && npm run quality:manifest && node --experimental-strip-types evaluation/run.mjs",
     "acceptance:run": "npm run build && node --experimental-strip-types evaluation/acceptance.mjs --run",
-    "acceptance:check": "node evaluation/acceptance.mjs"
+    "acceptance:check": "node evaluation/acceptance.mjs",
+    "release:build": "npm run build && node scripts/release.mjs"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "esbuild": "^0.28.2",
-    "eslint": "^10.9.1",
-    "obsidian": "^1.13.1",
-    "typescript": "^6.0.3",
-    "typescript-eslint": "^8.69.0"
+    "@eslint/js": "10.0.1",
+    "esbuild": "0.28.2",
+    "eslint": "10.9.1",
+    "eslint-plugin-obsidianmd": "0.4.2",
+    "obsidian": "1.13.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.69.0"
   },
   "engines": {
     "node": ">=22"

@@ -1,12 +1,43 @@
-import eslint from "@eslint/js";
-import tseslint from "typescript-eslint";
+import { defineConfig, globalIgnores } from "eslint/config";
+import obsidianmd from "eslint-plugin-obsidianmd";
 
-export default tseslint.config(
-  { ignores: [".scratch/", "main.js"] },
-  eslint.configs.recommended,
-  ...tseslint.configs.recommended,
+export default defineConfig(
+  globalIgnores([
+    ".scratch/",
+    "esbuild.config.mjs",
+    "evaluation/",
+    "main.js",
+    "package-lock.json",
+    "package.json",
+    "release-candidate/**",
+    "scripts/",
+    "test/",
+    "tsconfig.json",
+    "versions.json",
+  ]),
+  ...obsidianmd.configs.recommended,
   {
-    files: ["test/**/*.mjs"],
-    languageOptions: { globals: { Response: "readonly", URL: "readonly" } },
+    languageOptions: {
+      parserOptions: {
+        projectService: { allowDefaultProject: ["eslint.config.mjs"] },
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      "obsidianmd/ui/sentence-case": ["warn", {
+        acronyms: ["OS", "SSD"],
+        brands: [
+          "Grounded Answer",
+          "LLMvault",
+          "Local Model",
+          "Local Models",
+          "Local Processing",
+          "Ollama",
+          "Vault Chat",
+          "Vault Content",
+        ],
+        enforceCamelCaseLower: true,
+      }],
+    },
   },
 );

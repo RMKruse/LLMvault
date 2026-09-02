@@ -177,7 +177,7 @@ interface MarkdownPiece {
 }
 
 const encoder = new TextEncoder();
-const preprocessingLimitExceeded = Symbol("preprocessing_limit_exceeded");
+const preprocessingLimitExceeded = new Error("preprocessing_limit_exceeded");
 
 function assertWithinDeadline(deadline: number): void {
   if (performance.now() > deadline) throw preprocessingLimitExceeded;
