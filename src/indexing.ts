@@ -73,6 +73,7 @@ export interface EmbeddingModel {
 }
 
 export interface IndexSnapshot {
+  available: boolean;
   completed: number;
   latestPath?: string;
   outcomes: SourceOutcome[];
@@ -100,6 +101,7 @@ export interface RetrievedEvidence {
 
 interface IndexAdapter {
   exists(path: string): Promise<boolean>;
+  list(path: string): Promise<{ files: string[]; folders: string[] }>;
   mkdir(path: string): Promise<void>;
   process(path: string, update: (value: string) => string): Promise<string>;
   read(path: string): Promise<string>;
@@ -713,6 +715,11 @@ function outcomes(entries: SourceEntry[]): SourceOutcome[] {
       });
 }
 
+function exactSourceMatch(left: SourceEntry, right: SourceEntry): boolean {
+  return left.fingerprint === right.fingerprint && left.sourceKey === right.sourceKey &&
+    left.status === right.status;
+}
+
 function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
   try {
     const parsed: unknown = JSON.parse(value);
@@ -819,10 +826,11 @@ export class VaultIndex {
   ) => Promise<number[][]>;
   private querySequence = 0;
   private rebuildQueued = false;
+  private forceRebuild = false;
   private replacementQueued = false;
   private revision = 0;
   private readonly root: string;
-  private snapshot: IndexSnapshot = { completed: 0, outcomes: [], phase: "idle", statuses: {}, total: 0 };
+  private snapshot: IndexSnapshot = { available: false, completed: 0, outcomes: [], phase: "idle", statuses: {}, total: 0 };
   private readonly validateModel: (model: EmbeddingModel) => Promise<boolean>;
 
   constructor(
@@ -846,6 +854,16 @@ export class VaultIndex {
   cancel(): void {
     this.revision += 1;
     this.rebuildQueued = false;
+    this.forceRebuild = false;
+    const entries = this.active?.catalog.entries ?? [];
+    this.update({
+      available: Boolean(this.active),
+      completed: entries.length,
+      outcomes: outcomes(entries),
+      phase: this.active ? "failed" : "idle",
+      statuses: statusCounts(entries),
+      total: entries.length,
+    });
   }
 
   getSnapshot(): IndexSnapshot {
@@ -859,11 +877,11 @@ export class VaultIndex {
   async retrieve(question: string): Promise<RetrievedEvidence[]> {
     const active = this.active;
     const revision = this.revision;
-    if (this.snapshot.phase !== "ready" || !active || question.trim().length === 0) {
+    if (!active || question.trim().length === 0) {
       return [];
     }
     const dimension = active.catalog.signature.vectorDimension;
-    if (dimension === 0) return [];
+    if (dimension === 0 || !active.catalog.entries.some(({ status }) => status === "indexed")) return [];
     const queryVectors = await this.queryEmbed([question], active.model);
     if (revision !== this.revision) return [];
     const query = queryVectors[0];
@@ -1039,6 +1057,11 @@ export class VaultIndex {
     return this.queueDrain();
   }
 
+  rebuild(model: EmbeddingModel): Promise<IndexSnapshot> {
+    this.forceRebuild = true;
+    return this.start(model);
+  }
+
   private queueDrain(): Promise<IndexSnapshot> {
     if (this.drain) return this.drain;
     this.drain = Promise.resolve()
@@ -1047,7 +1070,9 @@ export class VaultIndex {
         while (this.rebuildQueued && this.model) {
           this.rebuildQueued = false;
           this.pendingPaths.clear();
-          result = await this.run(this.model, this.revision);
+          const force = this.forceRebuild;
+          this.forceRebuild = false;
+          result = await this.run(this.model, this.revision, force);
         }
         return result;
       })
@@ -1057,19 +1082,26 @@ export class VaultIndex {
     return this.drain;
   }
 
-  private async run(model: EmbeddingModel, revision: number): Promise<IndexSnapshot> {
-    if (!validModel(model)) return this.update({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
+  private async run(model: EmbeddingModel, revision: number, force: boolean): Promise<IndexSnapshot> {
+    if (!validModel(model)) {
+      const entries = this.active?.catalog.entries ?? [];
+      return this.update({ available: Boolean(this.active), completed: 0, outcomes: outcomes(entries), phase: "failed", statuses: statusCounts(entries), total: 0 });
+    }
     const sources = this.listSources().sort((left, right) => left.path.localeCompare(right.path));
     try {
       if (!(await this.validateModel(model))) throw new Error("embedding_model_unavailable");
       this.assertCurrent(revision);
-      this.update({ completed: 0, outcomes: [], phase: "indexing", statuses: {}, total: sources.length });
-      const restored = await this.restore(model, sources, revision);
-      if (restored) return restored;
+      this.update({ available: Boolean(this.active), completed: 0, outcomes: [], phase: "indexing", statuses: {}, total: sources.length });
+      if (!force) {
+        const restored = await this.restore(model, sources, revision);
+        if (restored) return restored;
+      }
+      if (!this.active) await this.cleanupGenerations();
       return await this.build(model, sources, revision);
     } catch {
       if (revision !== this.revision) return this.getSnapshot();
-      return this.update({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: sources.length });
+      const entries = this.active?.catalog.entries ?? [];
+      return this.update({ available: Boolean(this.active), completed: 0, outcomes: outcomes(entries), phase: "failed", statuses: statusCounts(entries), total: sources.length });
     }
   }
 
@@ -1092,6 +1124,54 @@ export class VaultIndex {
     return generation;
   }
 
+  private async cleanupGenerations(keepGenerationId?: string): Promise<void> {
+    const generations = `${this.root}/generations`;
+    const listed = await this.adapter.list(generations).catch(() => ({ files: [], folders: [] }));
+    const prefix = `${generations}/`;
+    for (const folder of listed.folders) {
+      const generationId = folder.startsWith(prefix) ? folder.slice(prefix.length) : "";
+      if (!generationId || generationId.includes("/") || generationId === keepGenerationId) continue;
+      await this.adapter.rmdir(folder, true).catch(() => undefined);
+    }
+  }
+
+  private async validateGeneration(
+    generationId: string,
+    model: EmbeddingModel,
+  ): Promise<Catalog | null> {
+    try {
+      const generation = `${this.root}/generations/${generationId}`;
+      const catalog = parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model);
+      if (!catalog || catalog.generationId !== generationId) return null;
+      const paths = new Set<string>();
+      for (const entry of catalog.entries) {
+        if (paths.has(entry.path)) return null;
+        paths.add(entry.path);
+        if (entry.status !== "indexed") {
+          if (entry.record !== undefined || entry.chunkCount !== undefined ||
+            entry.vectorCount !== undefined) return null;
+          continue;
+        }
+        const recordName = `records/${entry.sourceKey}-${entry.fingerprint}.json`;
+        if (entry.record !== recordName || !Number.isInteger(entry.chunkCount) ||
+          entry.chunkCount !== entry.vectorCount || !(await this.adapter.exists(`${generation}/${recordName}`))) {
+          return null;
+        }
+        const record = parseRecord(
+          await this.adapter.read(`${generation}/${recordName}`),
+          entry,
+          catalog.signature.vectorDimension,
+        );
+        if (!record || record.chunks.length !== entry.chunkCount || record.chunks.some(
+          (chunk, ordinal) => chunk.id !== `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
+        )) return null;
+      }
+      return catalog;
+    } catch {
+      return null;
+    }
+  }
+
   private async restore(
     model: EmbeddingModel,
     sources: VaultSource[],
@@ -1107,19 +1187,17 @@ export class VaultIndex {
     }
     if (!isRecord(active) || !isGenerationId(active.generationId)) return null;
     const generation = `${this.root}/generations/${active.generationId}`;
-    const catalog = parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model);
-    if (!catalog || catalog.generationId !== active.generationId || catalog.entries.length !== sources.length) return null;
+    const catalog = await this.validateGeneration(active.generationId, model);
+    if (!catalog) return null;
     const entriesByPath = new Map(catalog.entries.map((entry) => [entry.path, entry]));
+    const reusable: SourceEntry[] = [];
     for (const source of sources) {
       this.assertCurrent(revision);
       const expected = entriesByPath.get(source.path);
-      if (!expected) return null;
       const prepared = await prepareSource(source);
-      if (prepared.entry.fingerprint !== expected.fingerprint || prepared.entry.status !== expected.status ||
-        prepared.entry.sourceKey !== expected.sourceKey) return null;
+      if (!expected || !exactSourceMatch(prepared.entry, expected)) continue;
       if (expected.status === "indexed") {
         const recordName = `records/${expected.sourceKey}-${expected.fingerprint}.json`;
-        if (expected.record !== recordName || !(await this.adapter.exists(`${generation}/${recordName}`))) return null;
         const record = parseRecord(
           await this.adapter.read(`${generation}/${recordName}`),
           expected,
@@ -1127,17 +1205,37 @@ export class VaultIndex {
         );
         if (!record || record.chunks.length !== prepared.chunks.length ||
           record.chunks.length !== expected.chunkCount || record.chunks.length !== expected.vectorCount) return null;
+        let locatorsMatch = true;
         for (let ordinal = 0; ordinal < prepared.chunks.length; ordinal += 1) {
           const stored = record.chunks[ordinal];
           const current = prepared.chunks[ordinal];
           if (!stored || !current || stored.id !== `${expected.sourceKey}:${expected.fingerprint}:${ordinal}` ||
-            !sameLocator(stored.locator, locatorFor(source.path, current))) return null;
+            !sameLocator(stored.locator, locatorFor(source.path, current))) {
+            locatorsMatch = false;
+            break;
+          }
         }
+        if (!locatorsMatch) continue;
       }
+      reusable.push(expected);
     }
     this.assertCurrent(revision);
-    this.active = { catalog, model };
+    const currentCatalog = { ...catalog, entries: reusable };
+    this.active = { catalog: currentCatalog, model };
+    if (reusable.length !== sources.length || catalog.entries.length !== sources.length) {
+      this.update({
+        available: true,
+        completed: 0,
+        outcomes: outcomes(reusable),
+        phase: "indexing",
+        statuses: statusCounts(reusable),
+        total: sources.length,
+      });
+      return null;
+    }
+    await this.cleanupGenerations(catalog.generationId);
     return this.update({
+      available: true,
       completed: sources.length,
       outcomes: outcomes(catalog.entries),
       phase: "ready",
@@ -1155,13 +1253,40 @@ export class VaultIndex {
     const generation = await this.ensureDirectories(generationId);
     const entries: SourceEntry[] = [];
     let catalogCommitted = false;
-    let vectorDimension = 0;
+    const reusable = compatibleSignature(this.active?.catalog.signature, model)
+      ? new Map(this.active?.catalog.entries.map((entry) => [entry.path, entry]))
+      : new Map<string, SourceEntry>();
+    const reusableGeneration = this.active
+      ? `${this.root}/generations/${this.active.catalog.generationId}`
+      : "";
+    let vectorDimension = this.active && reusable.size > 0
+      ? this.active.catalog.signature.vectorDimension
+      : 0;
     try {
       for (const source of sources) {
         this.assertCurrent(revision);
         const prepared = await prepareSource(source);
         const entry = prepared.entry;
-        if (entry.status === "indexed") {
+        const previous = reusable.get(entry.path);
+        let reused = previous !== undefined && exactSourceMatch(entry, previous);
+        if (reused && entry.status === "indexed" && previous?.record) {
+          const serializedRecord = await this.adapter.read(
+            `${reusableGeneration}/${previous.record}`,
+          ).catch(() => "");
+          const record = parseRecord(serializedRecord, previous, vectorDimension);
+          reused = Boolean(record) && record?.chunks.length === prepared.chunks.length &&
+            record.chunks.every((chunk, ordinal) => {
+              const current = prepared.chunks[ordinal];
+              return current !== undefined && sameLocator(chunk.locator, locatorFor(source.path, current));
+            });
+          if (reused) {
+            entry.chunkCount = previous.chunkCount;
+            entry.record = previous.record;
+            entry.vectorCount = previous.vectorCount;
+            await this.adapter.write(`${generation}/${previous.record}`, serializedRecord);
+          }
+        }
+        if (!reused && entry.status === "indexed") {
           const storedChunks: StoredChunk[] = [];
           for (let offset = 0; offset < prepared.chunks.length; offset += EMBEDDING_BATCH_SIZE) {
             const batch = prepared.chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
@@ -1200,6 +1325,7 @@ export class VaultIndex {
         }
         entries.push(entry);
         this.update({
+          available: Boolean(this.active),
           completed: entries.length,
           latestPath: source.path,
           outcomes: outcomes(entries),
@@ -1217,36 +1343,28 @@ export class VaultIndex {
         signature: signatureFor(model, vectorDimension),
       };
       await this.adapter.write(`${generation}/catalog.json`, JSON.stringify(catalog));
-      if (!parseCatalog(await this.adapter.read(`${generation}/catalog.json`), model)) {
-        throw new TypeError("invalid_persisted_catalog");
-      }
+      const validatedCatalog = await this.validateGeneration(generationId, model);
+      if (!validatedCatalog) throw new TypeError("invalid_persisted_generation");
 
       const activePath = `${this.root}/active.json`;
-      let previousGeneration: string | undefined;
-      if (await this.adapter.exists(activePath)) {
-        try {
-          const previous: unknown = JSON.parse(await this.adapter.read(activePath));
-          if (isRecord(previous) && isGenerationId(previous.generationId)) previousGeneration = previous.generationId;
-        } catch {
-          previousGeneration = undefined;
-        }
-      }
       if (!(await this.adapter.exists(activePath))) await this.adapter.write(activePath, "");
       this.assertCurrent(revision);
-      await this.adapter.process(activePath, () => JSON.stringify({ generationId }));
+      await this.adapter.process(activePath, () => {
+        this.assertCurrent(revision);
+        return JSON.stringify({ generationId });
+      });
       catalogCommitted = true;
       this.assertCurrent(revision);
-      this.active = { catalog, model };
+      this.active = { catalog: validatedCatalog, model };
       const ready = this.update({
+        available: true,
         completed: sources.length,
         outcomes: outcomes(entries),
         phase: "ready",
         statuses: statusCounts(entries),
         total: sources.length,
       });
-      if (previousGeneration && previousGeneration !== generationId) {
-        await this.adapter.rmdir(`${this.root}/generations/${previousGeneration}`, true).catch(() => undefined);
-      }
+      await this.cleanupGenerations(generationId);
       return ready;
     } catch (error) {
       if (!catalogCommitted) {

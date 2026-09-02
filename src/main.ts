@@ -200,7 +200,15 @@ class VaultChatView extends ItemView {
         attr: { "aria-live": "polite", role: "status" },
         text: this.indexMessage(snapshot),
       });
-      if (snapshot.phase === "ready" && snapshot.outcomes.length > 0) {
+      if (snapshot.phase !== "idle") {
+        const rebuild = index.createEl("button", {
+          attr: { type: "button" },
+          text: snapshot.phase === "failed" ? "Retry rebuild" : "Rebuild index",
+        });
+        rebuild.disabled = snapshot.phase === "indexing";
+        rebuild.onclick = () => void this.plugin.rebuildIndex();
+      }
+      if (snapshot.outcomes.length > 0) {
         const files = index.createEl("ul", { cls: "llmvault-chat__outcomes" });
         for (const outcome of snapshot.outcomes) {
           files.createEl("li", { text: `${outcome.path}: ${this.outcomeMessage(outcome)}` });
@@ -221,10 +229,13 @@ class VaultChatView extends ItemView {
     }
     if (snapshot.phase === "indexing") {
       const current = snapshot.latestPath ? ` Current source: ${snapshot.latestPath}.` : "";
-      return `Indexing ${snapshot.completed} of ${snapshot.total} Vault Content files${outcomes ? ` (${outcomes})` : ""}.${current}`;
+      const available = snapshot.available ? " Previous generation remains available." : "";
+      return `Indexing ${snapshot.completed} of ${snapshot.total} Vault Content files${outcomes ? ` (${outcomes})` : ""}.${available}${current}`;
     }
     if (snapshot.phase === "failed") {
-      return "Indexing failed. Verify the selected embedding model and retry setup.";
+      return snapshot.available
+        ? "Rebuild failed. Previous generation remains available. Retry the rebuild."
+        : "Indexing failed. Verify the selected embedding model and retry.";
     }
     return "Indexing waits for compatible Local Model setup.";
   }
@@ -343,7 +354,7 @@ class VaultChatView extends ItemView {
   }
 
   private renderComposerState(snapshot = this.plugin.getIndexSnapshot()): void {
-    const ready = snapshot.phase === "ready";
+    const ready = snapshot.available;
     if (this.questionEl) this.questionEl.disabled = this.answering || !ready;
     if (this.askButton) {
       this.askButton.disabled = !this.answering && !ready;
@@ -780,6 +791,7 @@ class VaultChatView extends ItemView {
 export default class LLMvaultPlugin extends Plugin {
   private index?: VaultIndex;
   private indexSnapshot: IndexSnapshot = {
+    available: false,
     completed: 0,
     outcomes: [],
     phase: "idle",
@@ -985,15 +997,25 @@ export default class LLMvaultPlugin extends Plugin {
     return () => this.mutationSubscribers.delete(subscriber);
   }
 
-  async startIndexing(discovery: OllamaDiscovery, embeddingModel: string): Promise<void> {
+  async startIndexing(
+    discovery: OllamaDiscovery,
+    embeddingModel: string,
+    rebuild = false,
+  ): Promise<void> {
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
-      this.reportIndex({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
       return;
     }
     this.indexOllama.abortAll();
     this.index.cancel();
-    await this.index.start({ digest, name: embeddingModel });
+    await (rebuild
+      ? this.index.rebuild({ digest, name: embeddingModel })
+      : this.index.start({ digest, name: embeddingModel }));
+  }
+
+  async rebuildIndex(): Promise<void> {
+    await this.restoreIndex(true);
   }
 
   private vaultSources(): VaultSource[] {
@@ -1056,16 +1078,18 @@ export default class LLMvaultPlugin extends Plugin {
     for (const subscriber of this.indexSubscribers) subscriber(this.getIndexSnapshot());
   }
 
-  private async restoreIndex(): Promise<void> {
+  private async restoreIndex(rebuild = false): Promise<void> {
     const settings = this.getSettings();
     if (!settings.embeddingModel) return;
     try {
       const discovery = await this.discoverModels(settings.ollamaPort);
       if (discovery.embeddingModels.includes(settings.embeddingModel)) {
-        await this.startIndexing(discovery, settings.embeddingModel);
+        await this.startIndexing(discovery, settings.embeddingModel, rebuild);
+      } else {
+        this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
       }
     } catch {
-      this.reportIndex({ completed: 0, outcomes: [], phase: "failed", statuses: {}, total: 0 });
+      this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
     }
   }
 

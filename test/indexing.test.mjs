@@ -27,6 +27,18 @@ class MemoryAdapter {
     this.folders.add(path);
   }
 
+  async list(path) {
+    const prefix = `${path}/`;
+    return {
+      files: [...this.files.keys()].filter((item) =>
+        item.startsWith(prefix) && !item.slice(prefix.length).includes("/"),
+      ),
+      folders: [...this.folders].filter((item) =>
+        item.startsWith(prefix) && !item.slice(prefix.length).includes("/"),
+      ),
+    };
+  }
+
   async read(path) {
     if (!this.files.has(path)) throw new Error(`missing ${path}`);
     return this.files.get(path);
@@ -49,6 +61,28 @@ class MemoryAdapter {
     for (const key of [...this.folders]) {
       if (key === path || key.startsWith(`${path}/`)) this.folders.delete(key);
     }
+  }
+}
+
+const generationFolders = (adapter) =>
+  [...adapter.folders].filter((path) => path.match(/\/generations\/[^/]+$/));
+
+class PausingProcessAdapter extends MemoryAdapter {
+  commits = [];
+  pauseCommit = false;
+  releaseCommit = () => undefined;
+  signalCommit = () => undefined;
+  commitStarted = new Promise((resolve) => { this.signalCommit = resolve; });
+  commitReleased = new Promise((resolve) => { this.releaseCommit = resolve; });
+
+  async process(path, update) {
+    if (this.pauseCommit) {
+      this.signalCommit();
+      await this.commitReleased;
+    }
+    const committedPointer = await super.process(path, update);
+    this.commits.push(committedPointer);
+    return committedPointer;
   }
 }
 
@@ -229,9 +263,103 @@ test("a completed generation is restored without embedding unchanged Markdown", 
   catalog.entries[0].chunkCount += 1;
   catalog.entries[0].vectorCount += 1;
   await adapter.write(catalogPath, JSON.stringify(catalog));
+  await adapter.mkdir("plugin/index-v1/generations/00000000-0000-4000-8000-000000000000");
   const corrupted = new VaultIndex(adapter, "plugin/index-v1", () => sources, embed);
   assert.equal((await corrupted.start(model)).phase, "ready");
   assert.ok(embedCalls > callsAfterBuild);
+  assert.equal(generationFolders(adapter).length, 1);
+});
+
+test("restart removes abandoned generations without touching the valid active generation", async () => {
+  const adapter = new MemoryAdapter();
+  const model = { name: "embed", digest: "sha256:abc" };
+  const root = "plugin/index-v1";
+  const sources = () => [{ path: "Note.md", read: async () => "current" }];
+  const embed = async (inputs) => inputs.map(() => [1]);
+  await new VaultIndex(adapter, root, sources, embed).start(model);
+  const active = JSON.parse(await adapter.read(`${root}/active.json`)).generationId;
+  const abandoned = "00000000-0000-4000-8000-000000000000";
+  await adapter.mkdir(`${root}/generations/${abandoned}`);
+  await adapter.mkdir(`${root}/generations/${abandoned}/records`);
+  await adapter.write(`${root}/generations/${abandoned}/catalog.json`, JSON.stringify({
+    complete: false,
+    generationId: abandoned,
+  }));
+  await adapter.mkdir(`${root}/generations/corrupt-name`);
+
+  const restored = await new VaultIndex(adapter, root, sources, embed).start(model);
+
+  assert.equal(restored.phase, "ready");
+  assert.deepEqual(
+    generationFolders(adapter),
+    [`${root}/generations/${active}`],
+  );
+});
+
+test("restart cleans invalid generations even when recovery rebuild fails", async () => {
+  const adapter = new MemoryAdapter();
+  const root = "plugin/index-v1";
+  const model = { name: "embed", digest: "sha256:abc" };
+  const sources = () => [{ path: "Note.md", read: async () => "current" }];
+  await new VaultIndex(
+    adapter,
+    root,
+    sources,
+    async (inputs) => inputs.map(() => [1]),
+  ).start(model);
+  const catalogPath = [...adapter.files.keys()].find((path) => path.endsWith("/catalog.json"));
+  await adapter.write(catalogPath, "corrupt");
+  await adapter.mkdir(`${root}/generations/abandoned`);
+
+  const failed = await new VaultIndex(
+    adapter,
+    root,
+    sources,
+    async () => { throw new Error("embedding failed"); },
+  ).start(model);
+
+  assert.equal(failed.phase, "failed");
+  assert.equal(generationFolders(adapter).length, 0);
+});
+
+test("startup rebuild reuses only sources with an exact signature and fingerprint match", async () => {
+  const adapter = new MemoryAdapter();
+  const texts = new Map([
+    ["Alpha.md", "alpha"],
+    ["Beta.md", "beta"],
+  ]);
+  const embedded = [];
+  const sources = () => [...texts].map(([path, text]) => ({ path, read: async () => text }));
+  const embed = async (inputs) => {
+    embedded.push(...inputs);
+    return inputs.map(() => [1]);
+  };
+  const model = { name: "embed", digest: "sha256:abc" };
+  await new VaultIndex(adapter, "plugin/index-v1", sources, embed).start(model);
+  embedded.length = 0;
+  texts.set("Alpha.md", "changed alpha");
+
+  const rebuilt = await new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    sources,
+    embed,
+  ).start(model);
+
+  assert.equal(rebuilt.phase, "ready");
+  assert.deepEqual(embedded, ["changed alpha"]);
+
+  embedded.length = 0;
+  const incompatible = await new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    sources,
+    embed,
+  ).start({ name: "embed", digest: "sha256:changed" });
+
+  assert.equal(incompatible.phase, "ready");
+  assert.deepEqual(embedded, ["changed alpha", "beta"]);
+  assert.equal(generationFolders(adapter).length, 1);
 });
 
 test("questions retrieve at most four fresh sources with the generation's pinned model", async () => {
@@ -355,9 +483,69 @@ test("a failed replacement keeps partial and prior stale chunks unqueryable", as
   const failed = await index.start(model);
 
   assert.equal(failed.phase, "failed");
+  assert.equal(failed.available, true);
+  failEmbedding = false;
   assert.deepEqual(await index.retrieve("question"), []);
   assert.equal(await adapter.read("plugin/index-v1/active.json"), activeBefore);
   assert.equal([...adapter.files.values()].some((value) => value.includes("replacement")), false);
+});
+
+test("manual rebuild keeps the prior generation available until atomic activation", async () => {
+  const adapter = new PausingProcessAdapter();
+  const model = { name: "embed", digest: "sha256:abc" };
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [{ path: "Note.md", read: async () => "current" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start(model);
+  const previousPointer = await adapter.read("plugin/index-v1/active.json");
+
+  adapter.pauseCommit = true;
+  const rebuilding = index.rebuild(model);
+  await adapter.commitStarted;
+
+  assert.equal(index.getSnapshot().phase, "indexing");
+  assert.equal(index.getSnapshot().available, true);
+  assert.equal((await index.retrieve("question"))[0]?.text, "current");
+  assert.equal(await adapter.read("plugin/index-v1/active.json"), previousPointer);
+
+  adapter.pauseCommit = false;
+  adapter.releaseCommit();
+  const rebuilt = await rebuilding;
+  const nextPointer = await adapter.read("plugin/index-v1/active.json");
+
+  assert.equal(rebuilt.phase, "ready");
+  assert.equal(rebuilt.available, true);
+  assert.notEqual(nextPointer, previousPointer);
+  assert.equal(generationFolders(adapter).length, 1);
+});
+
+test("cancelled rebuild returns to the prior active generation", async () => {
+  const adapter = new PausingProcessAdapter();
+  const model = { name: "embed", digest: "sha256:abc" };
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [{ path: "Note.md", read: async () => "current" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start(model);
+  const previousPointer = await adapter.read("plugin/index-v1/active.json");
+  adapter.pauseCommit = true;
+  const rebuilding = index.rebuild(model);
+  await adapter.commitStarted;
+
+  index.cancel();
+  adapter.pauseCommit = false;
+  adapter.releaseCommit();
+  const cancelled = await rebuilding;
+
+  assert.equal(cancelled.phase, "failed");
+  assert.equal(cancelled.available, true);
+  assert.equal(await adapter.read("plugin/index-v1/active.json"), previousPointer);
+  assert.equal((await index.retrieve("question"))[0]?.text, "current");
 });
 
 test("Vault mutations tombstone immediately and serialize to the clean final index", async () => {
@@ -428,21 +616,7 @@ test("Vault mutations tombstone immediately and serialize to the clean final ind
 });
 
 test("a mutation during catalog commit cannot reactivate late evidence", async () => {
-  let signalCommit = () => undefined;
-  let releaseCommit = () => undefined;
-  const commitStarted = new Promise((resolve) => { signalCommit = resolve; });
-  const commitReleased = new Promise((resolve) => { releaseCommit = resolve; });
-  const adapter = new class extends MemoryAdapter {
-    pauseCommit = false;
-
-    async process(path, update) {
-      if (this.pauseCommit) {
-        signalCommit();
-        await commitReleased;
-      }
-      return await super.process(path, update);
-    }
-  }();
+  const adapter = new PausingProcessAdapter();
   let text = "original";
   let countReady = false;
   let readySnapshots = 0;
@@ -460,14 +634,15 @@ test("a mutation during catalog commit cannot reactivate late evidence", async (
   text = "intermediate";
   adapter.pauseCommit = true;
   const intermediate = index.invalidate(["Note.md"]);
-  await commitStarted;
+  await adapter.commitStarted;
   countReady = true;
   text = "final";
   const final = index.invalidate(["Note.md"]);
   adapter.pauseCommit = false;
-  releaseCommit();
+  adapter.releaseCommit();
   await Promise.all([intermediate, final]);
 
+  assert.equal(adapter.commits.length, 2);
   assert.equal(readySnapshots, 1);
   assert.equal((await index.retrieve("question"))[0]?.text, "final");
 });
@@ -516,4 +691,80 @@ test("invalid embedding vectors never activate a generation", async () => {
 
   assert.equal(result.phase, "failed");
   assert.equal(await adapter.exists("plugin/index-v1/active.json"), false);
+});
+
+test("activation revalidates the complete generation after catalog construction", async () => {
+  const adapter = new class extends MemoryAdapter {
+    async write(path, value) {
+      await super.write(path, value);
+      if (!path.endsWith("/catalog.json")) return;
+      const recordPath = [...this.files.keys()].find((item) => item.includes("/records/"));
+      const record = JSON.parse(await this.read(recordPath));
+      record.chunks[0].vector = "corrupt";
+      await super.write(recordPath, JSON.stringify(record));
+    }
+  }();
+  const index = new VaultIndex(
+    adapter,
+    "plugin/index-v1",
+    () => [{ path: "Note.md", read: async () => "text" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+
+  const result = await index.start({ name: "embed", digest: "sha256:abc" });
+
+  assert.equal(result.phase, "failed");
+  assert.equal(await adapter.exists("plugin/index-v1/active.json"), false);
+});
+
+test("restart converges after termination at every durable generation boundary", async () => {
+  for (const boundary of ["record", "catalog", "pointer", "cleanup"]) {
+    const adapter = new class extends MemoryAdapter {
+      armed = false;
+
+      async write(path, value) {
+        await super.write(path, value);
+        if (this.armed &&
+          ((boundary === "record" && path.includes("/records/")) ||
+            (boundary === "catalog" && path.endsWith("/catalog.json")))) {
+          this.armed = false;
+          throw new Error("terminated");
+        }
+      }
+
+      async process(path, update) {
+        const committedPointer = await super.process(path, update);
+        if (this.armed && boundary === "pointer") {
+          this.armed = false;
+          throw new Error("terminated");
+        }
+        return committedPointer;
+      }
+
+      async rmdir(path) {
+        await super.rmdir(path);
+        if (this.armed && boundary === "cleanup") {
+          this.armed = false;
+          throw new Error("terminated");
+        }
+      }
+    }();
+    let text = "old";
+    const model = { name: "embed", digest: "sha256:abc" };
+    const sources = () => [{ path: "Note.md", read: async () => text }];
+    const embed = async (inputs) => inputs.map(() => [1]);
+    const interrupted = new VaultIndex(adapter, "plugin/index-v1", sources, embed);
+    await interrupted.start(model);
+    text = "canonical";
+    adapter.armed = true;
+    await interrupted.invalidate(["Note.md"]);
+    adapter.armed = false;
+
+    const restarted = new VaultIndex(adapter, "plugin/index-v1", sources, embed);
+    const recovered = await restarted.start(model);
+
+    assert.equal(recovered.phase, "ready", boundary);
+    assert.equal((await restarted.retrieve("question"))[0]?.text, "canonical", boundary);
+    assert.equal(generationFolders(adapter).length, 1, boundary);
+  }
 });

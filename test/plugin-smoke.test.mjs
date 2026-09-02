@@ -20,6 +20,8 @@ test("build produces an installable desktop Vault Chat plugin", async () => {
   assert.match(bundle, /INSUFFICIENT_EVIDENCE/);
   assert.match(bundle, /Open source/);
   assert.match(bundle, /Stop/);
+  assert.match(bundle, /Rebuild index/);
+  assert.match(bundle, /Previous generation remains available/);
   assert.match(styles, /\.llmvault-chat/);
   assert.match(styles, /\.llmvault-chat__citation/);
 });
