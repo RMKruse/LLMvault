@@ -53,6 +53,24 @@ test("only complete conversations restore from plugin data", () => {
   assert.equal(state.selectedConversationId, "conversation-1");
 });
 
+test("persisted evidence accepts only application-issued opaque citation IDs", () => {
+  const state = normalizeConversationState({
+    conversations: [{
+      createdAt: 10,
+      id: "conversation-1",
+      title: "Hostile evidence",
+      turns: [{
+        ...turn,
+        evidence: [{ ...evidence, citationId: "https://example.com/../../secret" }],
+      }],
+      updatedAt: 20,
+    }],
+    selectedConversationId: "conversation-1",
+  });
+
+  assert.deepEqual(state, { conversations: [], selectedConversationId: null });
+});
+
 test("completed turns preserve per-turn evidence in application-owned chat history", () => {
   const state = completeTurn(
     { conversations: [], selectedConversationId: null },

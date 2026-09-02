@@ -300,6 +300,10 @@ test("chat streams only answer content from strict NDJSON and requires done", as
   const result = await client.chat(11434, "chat", messages, (chunk) => chunks.push(chunk));
 
   assert.equal(request.input, "http://127.0.0.1:11434/api/chat");
+  assert.deepEqual(
+    [request.init.method, request.init.redirect, request.init.credentials, request.init.cache],
+    ["POST", "error", "omit", "no-store"],
+  );
   assert.deepEqual(JSON.parse(request.init.body), {
     model: "chat",
     messages,
@@ -324,6 +328,26 @@ test("chat streams only answer content from strict NDJSON and requires done", as
         ["invalid_response", "stream_interrupted"].includes(error.code),
     );
   }
+});
+
+test("chat rejects a declared response overrun before accepting model output", async () => {
+  const client = new OllamaClient(async () => new Response(
+    '{"message":{"content":"must stay inert"},"done":true}\n',
+    { headers: {
+      "content-length": String(16 * 1024 * 1024 + 1),
+      "content-type": "application/x-ndjson",
+    } },
+  ));
+
+  await assert.rejects(
+    client.chat(
+      11434,
+      "chat",
+      [{ role: "user", content: "Question" }],
+      () => assert.fail("oversized output was emitted"),
+    ),
+    (error) => error instanceof OllamaError && error.code === "invalid_response",
+  );
 });
 
 test("non-stream chat uses the same terminal contract and retains diagnostics", async () => {
@@ -358,9 +382,30 @@ test("non-stream chat uses the same terminal contract and retains diagnostics", 
   });
 });
 
-test("chat retains bounded Ollama HTTP error detail", async () => {
+test("diagnostics reject model-controlled strings outside the stable allowlist", async () => {
   const client = new OllamaClient(async () =>
-    json({ error: "context is too long" }, { status: 400 }),
+    json({
+      message: { content: "Answer" },
+      done: true,
+      done_reason: "stop\nsecret content",
+      eval_count: 7,
+    }),
+  );
+
+  const result = await client.chat(
+    11434,
+    "chat",
+    [{ role: "user", content: "Question" }],
+    () => undefined,
+    false,
+  );
+
+  assert.deepEqual(result.diagnostics, { eval_count: 7 });
+});
+
+test("chat rejects Ollama HTTP error content in favor of stable codes", async () => {
+  const client = new OllamaClient(async () =>
+    json({ error: "context is\u0000 too\nlong" }, { status: 400 }),
   );
 
   await assert.rejects(
@@ -373,6 +418,25 @@ test("chat retains bounded Ollama HTTP error detail", async () => {
     (error) =>
       error instanceof OllamaError &&
       error.code === "invalid_request" &&
-      error.detail === "context is too long",
+      !("detail" in error),
   );
+});
+
+test("HTTP failures cancel unread response bodies before clearing the deadline", async () => {
+  let canceled = false;
+  const client = new OllamaClient(async () => new Response(
+    new ReadableStream({ cancel() { canceled = true; } }),
+    { status: 500 },
+  ));
+
+  await assert.rejects(
+    client.chat(
+      11434,
+      "chat",
+      [{ role: "user", content: "Question" }],
+      () => undefined,
+    ),
+    (error) => error instanceof OllamaError && error.code === "ollama_server_error",
+  );
+  assert.equal(canceled, true);
 });

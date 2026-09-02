@@ -1095,8 +1095,7 @@ class VaultChatView extends ItemView {
     if (!(error instanceof OllamaError)) {
       return "The operation could not be completed. Retry it.";
     }
-    const recovery = RECOVERY_MESSAGES[error.code];
-    return error.detail ? `${recovery} Ollama: ${error.detail}` : recovery;
+    return RECOVERY_MESSAGES[error.code];
   }
 }
 

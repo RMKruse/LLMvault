@@ -31,10 +31,13 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const finiteNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);
 
+const isCitationId = (value: unknown): value is string =>
+  typeof value === "string" && /^S[1-9]\d*-[1-9]\d*$/.test(value);
+
 function normalizeEvidence(value: unknown): RetrievedEvidence | null {
   if (
     !record(value) ||
-    typeof value.citationId !== "string" ||
+    !isCitationId(value.citationId) ||
     typeof value.chunkId !== "string" ||
     !finiteNumber(value.end) ||
     typeof value.fingerprint !== "string" ||
