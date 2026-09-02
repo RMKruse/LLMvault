@@ -1,3 +1,5 @@
+import { minimumScoreFor } from "./quality.ts";
+
 export const CHUNK_TARGET_BYTES = 2_048;
 export const CHUNK_OVERLAP_BYTES = 512;
 export const RAW_FILE_LIMIT_BYTES = 10 * 1024 * 1024;
@@ -117,7 +119,7 @@ type SourceEntry = SourceOutcome & {
   vectorCount?: number;
 };
 
-interface Signature {
+export interface IndexSignature {
   chunkOverlapBytes: number;
   chunkTargetBytes: number;
   chunkerVersion: number;
@@ -132,7 +134,7 @@ interface Catalog {
   complete: true;
   entries: SourceEntry[];
   generationId: string;
-  signature: Signature;
+  signature: IndexSignature;
 }
 
 type PreparedChunk =
@@ -516,7 +518,7 @@ function validModel(model: EmbeddingModel): boolean {
   return model.name.length > 0 && model.name.length <= 512 && model.digest.length > 0 && model.digest.length <= 512;
 }
 
-function signatureFor(model: EmbeddingModel, vectorDimension: number): Signature {
+function signatureFor(model: EmbeddingModel, vectorDimension: number): IndexSignature {
   return {
     chunkOverlapBytes: CHUNK_OVERLAP_BYTES,
     chunkTargetBytes: CHUNK_TARGET_BYTES,
@@ -529,7 +531,7 @@ function signatureFor(model: EmbeddingModel, vectorDimension: number): Signature
   };
 }
 
-function compatibleSignature(value: unknown, model: EmbeddingModel): value is Signature {
+function compatibleSignature(value: unknown, model: EmbeddingModel): value is IndexSignature {
   if (!isRecord(value)) return false;
   const expected = signatureFor(model, Number(value.vectorDimension));
   return Number.isInteger(value.vectorDimension) && Number(value.vectorDimension) >= 0 &&
@@ -903,7 +905,14 @@ export class VaultIndex {
     };
   }
 
-  async retrieve(question: string): Promise<RetrievedEvidence[]> {
+  getSignature(): IndexSignature | null {
+    return this.active ? { ...this.active.catalog.signature } : null;
+  }
+
+  async retrieve(
+    question: string,
+    applyCalibratedCutoff = true,
+  ): Promise<RetrievedEvidence[]> {
     const active = this.active;
     const revision = this.revision;
     if (!active || question.trim().length === 0) {
@@ -958,7 +967,11 @@ export class VaultIndex {
     const sources = new Map(this.listSources().map((source) => [source.path, source]));
     const evidence: RetrievedEvidence[] = [];
     const queryId = ++this.querySequence;
+    const minimumScore = applyCalibratedCutoff
+      ? minimumScoreFor(active.catalog.signature)
+      : undefined;
     for (const candidate of ranked) {
+      if (minimumScore !== undefined && candidate.score < minimumScore) continue;
       const source = sources.get(candidate.entry.path);
       const hydrated = source
         ? await this.hydrate(candidate.entry, candidate.chunk, candidate.score, source)
