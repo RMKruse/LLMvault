@@ -8,9 +8,8 @@ import {
   answerParts,
   calibrateCutoff,
   GROUNDING_SYSTEM_PROMPT,
-  qualityLabel,
 } from "../src/quality.ts";
-import { EVALUATED_CONFIGURATION } from "../src/evaluated-configuration.ts";
+import { REFERENCE_CONFIGURATION } from "../src/retrieval-calibration.ts";
 
 const fixtureRoot = new URL("../evaluation/reference-vault-v1/", import.meta.url);
 
@@ -62,26 +61,11 @@ test("calibration keeps every gold unit and is scoped to one embedding digest", 
   );
 });
 
-test("only the exact passing model pair receives the evaluated label", () => {
-  const evaluated = EVALUATED_CONFIGURATION;
-  assert.equal(
-    qualityLabel(
-      evaluated.chatModel.name,
-      evaluated.chatModel.digest,
-      evaluated.embeddingModel.name,
-      evaluated.embeddingModel.digest,
-    ),
-    "evaluated configuration",
-  );
-  assert.equal(
-    qualityLabel(
-      evaluated.chatModel.name,
-      `${evaluated.chatModel.digest}-changed`,
-      evaluated.embeddingModel.name,
-      evaluated.embeddingModel.digest,
-    ),
-    "quality not evaluated for this model",
-  );
+test("model selection remains user-controlled without an unearned quality claim", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /evaluated configuration|recommended model/i);
+  assert.match(source, /Choose a compatible chat model/);
+  assert.match(source, /Choose a compatible embedding model/);
 });
 
 test("production answer parsing activates only query-registry citations", () => {
@@ -107,27 +91,27 @@ test("the production prompt treats false-premise questions as insufficient", () 
   assert.match(GROUNDING_SYSTEM_PROMPT, /begin exactly with INSUFFICIENT_EVIDENCE:/);
 });
 
-test("retrieval applies a cutoff only to its exact evaluated embedding digest", async () => {
-  const cutoff = EVALUATED_CONFIGURATION.minimumScore;
+test("retrieval applies a cutoff only to its exact calibrated embedding digest", async () => {
+  const cutoff = REFERENCE_CONFIGURATION.minimumScore;
   const sources = [
     { path: "high.md", read: async () => "high" },
     { path: "low.md", read: async () => "low" },
   ];
   const embed = async (inputs) => inputs.map((input) => [
     input === "question" ? 1 : input === "high" ? cutoff + 0.1 : cutoff - 0.1,
-    ...Array(EVALUATED_CONFIGURATION.indexSignature.vectorDimension - 1).fill(0),
+    ...Array(REFERENCE_CONFIGURATION.indexSignature.vectorDimension - 1).fill(0),
   ]);
   const exact = new VaultIndex(new MemoryAdapter(), "index", () => sources, embed);
-  await exact.start(EVALUATED_CONFIGURATION.embeddingModel);
+  await exact.start(REFERENCE_CONFIGURATION.embeddingModel);
 
   assert.deepEqual((await exact.retrieve("question")).map(({ path }) => path), ["high.md"]);
 
   const other = new VaultIndex(new MemoryAdapter(), "index", () => sources, embed);
-  await other.start({ ...EVALUATED_CONFIGURATION.embeddingModel, digest: "sha256:other" });
+  await other.start({ ...REFERENCE_CONFIGURATION.embeddingModel, digest: "sha256:other" });
   assert.deepEqual((await other.retrieve("question")).map(({ path }) => path), ["high.md", "low.md"]);
 });
 
-test("Reference Evaluation Vault manifest is complete and checksummed", async () => {
+test("synthetic quality-suite fixture is complete and checksummed", async () => {
   const manifest = JSON.parse(await readFile(new URL("manifest.json", fixtureRoot), "utf8"));
   const sourceNames = (await readdir(new URL("sources/", fixtureRoot))).sort();
 

@@ -32,7 +32,7 @@ import {
   normalizeConversationState,
   selectConversation,
 } from "./conversations";
-import { answerParts, GROUNDING_SYSTEM_PROMPT, qualityLabel } from "./quality.ts";
+import { answerParts, GROUNDING_SYSTEM_PROMPT } from "./quality.ts";
 
 const VIEW_TYPE_VAULT_CHAT = "vault-chat-view";
 
@@ -596,7 +596,7 @@ class VaultChatView extends ItemView {
 
   private renderAnswer(
     text: string,
-    heading = `Grounded Answer · ${this.qualityLabel()}`,
+    heading = "Grounded Answer",
     question?: string,
   ): void {
     const answer = this.answerEl;
@@ -796,10 +796,6 @@ class VaultChatView extends ItemView {
       this.discovery?.embeddingModels ?? [],
       this.embeddingModel,
     );
-    const quality = form.createEl("p", {
-      cls: "llmvault-chat__quality",
-      text: this.qualityLabel(),
-    });
     const complete = form.createEl("button", {
       cls: "mod-cta",
       attr: { type: "button" },
@@ -809,7 +805,6 @@ class VaultChatView extends ItemView {
     const updateCompleteButton = (): void => {
       complete.disabled =
         this.busy || !this.discovery || !this.chatModel || !this.embeddingModel;
-      quality.setText(this.qualityLabel());
     };
     updateCompleteButton();
 
@@ -938,15 +933,6 @@ class VaultChatView extends ItemView {
   private port(): number | null {
     const port = Number(this.portValue);
     return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
-  }
-
-  private qualityLabel(): string {
-    return qualityLabel(
-      this.chatModel,
-      this.chatModel ? this.discovery?.modelDigests[this.chatModel] : undefined,
-      this.embeddingModel,
-      this.embeddingModel ? this.discovery?.modelDigests[this.embeddingModel] : undefined,
-    );
   }
 
   private async refreshModels(): Promise<void> {

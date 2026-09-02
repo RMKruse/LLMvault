@@ -1,8 +1,4 @@
-export const EVALUATED_CONFIGURATION = {
-  chatModel: {
-    digest: "7c75d6f0f4b974c8761fe291ab4d808754b6a6b1420c60663c519363b49a26e1",
-    name: "gemma4:12b-mlx",
-  },
+export const REFERENCE_CONFIGURATION = {
   embeddingModel: {
     digest: "df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
     name: "qwen3-embedding:4b",
@@ -35,8 +31,8 @@ export const CALIBRATED_CUTOFFS = [
     minimumScore: 0.5448656969693813,
   },
   {
-    embeddingModel: EVALUATED_CONFIGURATION.embeddingModel,
-    indexSignature: EVALUATED_CONFIGURATION.indexSignature,
-    minimumScore: EVALUATED_CONFIGURATION.minimumScore,
+    embeddingModel: REFERENCE_CONFIGURATION.embeddingModel,
+    indexSignature: REFERENCE_CONFIGURATION.indexSignature,
+    minimumScore: REFERENCE_CONFIGURATION.minimumScore,
   },
 ] as const;
