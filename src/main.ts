@@ -507,6 +507,7 @@ class VaultChatView extends ItemView {
     if (!question) return;
     const requestedAt = new Date();
     const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const dailyRecap = this.plugin.dailyRecapRequest(question, requestedAt, timeZone);
 
     const conversationId = this.plugin.getConversationState().selectedConversationId;
     this.displayGeneration += 1;
@@ -548,7 +549,7 @@ class VaultChatView extends ItemView {
 
       let streamed = "";
       this.renderAnswer(streamed, "Answering…", question);
-      const userMessage = conversationUserMessage(question, evidence);
+      const userMessage = conversationUserMessage(question, evidence, dailyRecap?.date);
       const messages: OllamaMessage[] = [
         { role: "system", content: GROUNDING_SYSTEM_PROMPT },
         ...this.plugin.getConversationMessages(conversationId),
@@ -1594,7 +1595,7 @@ export default class LLMvaultPlugin extends Plugin {
       });
   }
 
-  private dailyRecapRequest(question: string, now: Date, timeZone: string) {
+  dailyRecapRequest(question: string, now: Date, timeZone: string) {
     return resolveDailyRecapRequest(
       question,
       now,

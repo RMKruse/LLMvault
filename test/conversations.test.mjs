@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   completeTurn,
   conversationMessages,
+  conversationUserMessage,
   deleteConversation,
   newConversation,
   normalizeConversationState,
@@ -89,6 +90,19 @@ test("completed turns preserve per-turn evidence in application-owned chat histo
     },
     { role: "assistant", content: "A grounded answer [S1-1]" },
   ]);
+});
+
+test("Daily Recap current messages include the resolved date", () => {
+  assert.deepEqual(
+    conversationUserMessage("Summary of yesterday", [evidence], "2026.09.02"),
+    {
+      role: "user",
+      content:
+        "Summary of yesterday\n\nResolved Daily Recap date: 2026.09.02\n\n" +
+        "UNTRUSTED_EVIDENCE_JSON:\n" +
+        '[{"citationId":"S1-1","text":"Stored evidence"}]',
+    },
+  );
 });
 
 test("new, select, and delete change selection without rewriting prior records", () => {

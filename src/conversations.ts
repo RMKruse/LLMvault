@@ -149,10 +149,11 @@ export function conversationMessages(conversation?: Conversation): OllamaMessage
 export function conversationUserMessage(
   question: string,
   evidence: Pick<RetrievedEvidence, "citationId" | "text">[],
+  dailyRecapDate?: string,
 ): OllamaMessage {
   return {
     role: "user",
-    content: `${question}\n\nUNTRUSTED_EVIDENCE_JSON:\n${JSON.stringify(
+    content: `${question}${dailyRecapDate ? `\n\nResolved Daily Recap date: ${dailyRecapDate}` : ""}\n\nUNTRUSTED_EVIDENCE_JSON:\n${JSON.stringify(
       evidence.map(({ citationId, text }) => ({ citationId, text })),
     )}`,
   };
