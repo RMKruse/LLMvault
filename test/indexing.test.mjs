@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TextEncoder } from "node:util";
+import { normalizeConversationState } from "../src/conversations.ts";
 
 import {
   CHUNK_OVERLAP_BYTES,
@@ -67,6 +68,38 @@ class MemoryAdapter {
 
 const generationFolders = (adapter) =>
   [...adapter.folders].filter((path) => path.match(/\/generations\/[^/]+$/));
+
+test("saved evidence resolves after restoration and malformed locators are unavailable", async () => {
+  const index = new VaultIndex(
+    new MemoryAdapter(), "plugin/index-v1",
+    () => [
+      { path: "Note.md", read: async () => "Stored evidence" },
+      { path: "Board.canvas", read: async () => JSON.stringify({
+        nodes: [{ id: "card-1", type: "text", text: "Stored evidence" }], edges: [],
+      }) },
+    ],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  const evidence = await index.retrieve("question");
+  assert.equal(evidence.length, 2);
+  const state = normalizeConversationState(JSON.parse(JSON.stringify({
+    conversations: [{
+      createdAt: 10, id: "conversation-1", title: "Question", updatedAt: 20,
+      turns: [{ answer: "Answer", completedAt: 20, evidence, kind: "answer", question: "Question", status: "complete" }],
+    }],
+    selectedConversationId: "conversation-1",
+  })));
+  const restored = state.conversations[0].turns[0].evidence;
+  assert.deepEqual(await Promise.all(restored.map((item) => index.resolveEvidence(item))), evidence);
+  for (const item of restored) {
+    for (const field of item.format === "markdown" ? ["startLine", "endLine"] : ["nodeId", "excerpt"]) {
+      const malformed = { ...item };
+      delete malformed[field];
+      assert.equal(await index.resolveEvidence(malformed), null, field);
+    }
+  }
+});
 
 class PausingProcessAdapter extends MemoryAdapter {
   commits = [];

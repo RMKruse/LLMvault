@@ -1,4 +1,4 @@
-import type { RetrievedEvidence } from "./indexing";
+import { isStoredLocator, locatorFor, type RetrievedEvidence } from "./indexing.ts";
 import type { OllamaMessage } from "./ollama";
 
 export const INSUFFICIENT_PREFIX = "INSUFFICIENT_EVIDENCE:";
@@ -39,36 +39,19 @@ function normalizeEvidence(value: unknown): RetrievedEvidence | null {
     !record(value) ||
     !isCitationId(value.citationId) ||
     typeof value.chunkId !== "string" ||
-    !finiteNumber(value.end) ||
     typeof value.fingerprint !== "string" ||
-    (value.format !== "markdown" && value.format !== "canvas") ||
-    typeof value.path !== "string" ||
     !finiteNumber(value.score) ||
-    !finiteNumber(value.start) ||
     typeof value.text !== "string"
   ) return null;
 
-  const evidence: RetrievedEvidence = {
+  const evidence = {
     citationId: value.citationId,
     chunkId: value.chunkId,
-    end: value.end,
     fingerprint: value.fingerprint,
-    format: value.format,
-    path: value.path,
     score: value.score,
-    start: value.start,
     text: value.text,
   };
-  if (finiteNumber(value.endLine)) evidence.endLine = value.endLine;
-  if (typeof value.excerpt === "string") evidence.excerpt = value.excerpt;
-  if (typeof value.nodeId === "string") evidence.nodeId = value.nodeId;
-  if (finiteNumber(value.startLine)) evidence.startLine = value.startLine;
-  if (
-    record(value.anchor) &&
-    (value.anchor.type === "heading" || value.anchor.type === "block") &&
-    typeof value.anchor.value === "string"
-  ) evidence.anchor = { type: value.anchor.type, value: value.anchor.value };
-  return evidence;
+  return isStoredLocator(value) ? { ...locatorFor(value.path, value), ...evidence } : null;
 }
 
 function normalizeTurn(value: unknown): CompletedTurn | null {

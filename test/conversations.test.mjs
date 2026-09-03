@@ -72,6 +72,45 @@ test("persisted evidence accepts only application-issued opaque citation IDs", (
   assert.deepEqual(state, { conversations: [], selectedConversationId: null });
 });
 
+test("saved evidence requires valid format-specific locators", () => {
+  const canvas = {
+    ...evidence, format: "canvas", path: "Board.canvas", nodeId: "card-1", excerpt: "Stored evidence",
+  };
+  delete canvas.startLine;
+  delete canvas.endLine;
+  const restore = (item) => normalizeConversationState({
+    conversations: [{
+      createdAt: 10, id: "conversation-1", title: "Question", updatedAt: 20,
+      turns: [{ ...turn, evidence: [item] }],
+    }],
+    selectedConversationId: "conversation-1",
+  });
+  for (const item of [evidence, canvas, { ...evidence, anchor: { type: "heading", value: "Title" } }]) {
+    assert.deepEqual(restore(item).conversations[0].turns[0].evidence, [item]);
+  }
+  for (const [item, changes] of [
+    [evidence, { startLine: undefined }],
+    [evidence, { endLine: undefined }],
+    [evidence, { startLine: 0 }],
+    [evidence, { startLine: 1.5 }],
+    [evidence, { endLine: 0 }],
+    [evidence, { endLine: Infinity }],
+    [evidence, { startLine: 3, endLine: 2 }],
+    [evidence, { anchor: { type: "heading", value: "" } }],
+    [canvas, { nodeId: undefined }],
+    [canvas, { nodeId: "" }],
+    [canvas, { excerpt: undefined }],
+    [canvas, { excerpt: "" }],
+    [evidence, { start: -1 }],
+    [canvas, { end: 0 }],
+    [canvas, { end: 1.5 }],
+  ]) {
+    assert.deepEqual(restore({ ...item, ...changes }), {
+      conversations: [], selectedConversationId: null,
+    }, `${item.format}: ${JSON.stringify(changes)}`);
+  }
+});
+
 test("completed turns preserve per-turn evidence in application-owned chat history", () => {
   const state = completeTurn(
     { conversations: [], selectedConversationId: null },

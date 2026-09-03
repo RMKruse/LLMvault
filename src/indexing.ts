@@ -84,22 +84,14 @@ export interface IndexSnapshot {
   total: number;
 }
 
-export interface RetrievedEvidence {
-  anchor?: Omit<MarkdownAnchor, "offset">;
-  citationId: string;
+type UncitedEvidence = StoredLocator & {
   chunkId: string;
-  end: number;
-  endLine?: number;
-  excerpt?: string;
   fingerprint: string;
-  format: "markdown" | "canvas";
-  nodeId?: string;
-  path: string;
   score: number;
-  start: number;
-  startLine?: number;
   text: string;
-}
+};
+
+export type RetrievedEvidence = UncitedEvidence & { citationId: string };
 
 export interface DailyRecapRequest {
   date?: string;
@@ -806,20 +798,8 @@ function parseRecord(value: string, entry: SourceEntry, dimension: number): Sour
     if (!isRecord(parsed) || parsed.sourceKey !== entry.sourceKey || parsed.fingerprint !== entry.fingerprint ||
       parsed.vectorDimension !== dimension || !Array.isArray(parsed.chunks) || parsed.chunks.length === 0) return null;
     for (const chunk of parsed.chunks) {
-      if (!isRecord(chunk) || typeof chunk.id !== "string" || !isRecord(chunk.locator) ||
-        !validEncodedVector(chunk.vector, dimension)) return null;
-      const locator = chunk.locator;
-      if (locator.path !== entry.path || ![locator.start, locator.end].every(Number.isInteger) ||
-        Number(locator.start) < 0 || Number(locator.end) <= Number(locator.start) ||
-        !["markdown", "canvas"].includes(String(locator.format))) return null;
-      if (locator.format === "markdown") {
-        if (![locator.startLine, locator.endLine].every(Number.isInteger) ||
-          Number(locator.startLine) < 1 || Number(locator.endLine) < Number(locator.startLine)) return null;
-        if (locator.anchor !== undefined &&
-          (!isRecord(locator.anchor) || !["heading", "block"].includes(String(locator.anchor.type)) ||
-            typeof locator.anchor.value !== "string" || locator.anchor.value.length === 0)) return null;
-      } else if (typeof locator.nodeId !== "string" || locator.nodeId.length === 0 ||
-        typeof locator.excerpt !== "string" || locator.excerpt.length === 0) return null;
+      if (!isRecord(chunk) || typeof chunk.id !== "string" || !isStoredLocator(chunk.locator) ||
+        chunk.locator.path !== entry.path || !validEncodedVector(chunk.vector, dimension)) return null;
     }
     return parsed as unknown as SourceRecord;
   } catch {
@@ -827,9 +807,23 @@ function parseRecord(value: string, entry: SourceEntry, dimension: number): Sour
   }
 }
 
-function locatorFor(path: string, chunk: PreparedChunk | RetrievedEvidence): StoredLocator {
+export function isStoredLocator(value: unknown): value is StoredLocator {
+  if (!isRecord(value) || typeof value.path !== "string" ||
+    ![value.start, value.end].every(Number.isInteger) ||
+    Number(value.start) < 0 || Number(value.end) <= Number(value.start)) return false;
+  if (value.format === "markdown") {
+    return [value.startLine, value.endLine].every(Number.isInteger) &&
+      Number(value.startLine) >= 1 && Number(value.endLine) >= Number(value.startLine) &&
+      (value.anchor === undefined || (isRecord(value.anchor) &&
+        (value.anchor.type === "heading" || value.anchor.type === "block") &&
+        typeof value.anchor.value === "string" && value.anchor.value.length > 0));
+  }
+  return value.format === "canvas" && typeof value.nodeId === "string" && value.nodeId.length > 0 &&
+    typeof value.excerpt === "string" && value.excerpt.length > 0;
+}
+
+export function locatorFor(path: string, chunk: PreparedChunk | StoredLocator): StoredLocator {
   if (chunk.format === "canvas") {
-    if (!chunk.nodeId || !chunk.excerpt) throw new TypeError("invalid_canvas_locator");
     return {
       end: chunk.end,
       excerpt: chunk.excerpt,
@@ -838,9 +832,6 @@ function locatorFor(path: string, chunk: PreparedChunk | RetrievedEvidence): Sto
       path,
       start: chunk.start,
     };
-  }
-  if (chunk.startLine === undefined || chunk.endLine === undefined) {
-    throw new TypeError("invalid_markdown_locator");
   }
   return {
     ...(chunk.anchor ? { anchor: chunk.anchor } : {}),
@@ -1073,7 +1064,7 @@ export class VaultIndex {
   }
 
   async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
-    if (!this.hasEvidence(evidence)) return null;
+    if (!isStoredLocator(evidence) || !this.hasEvidence(evidence)) return null;
     const source = this.listSources().find(({ path }) => path === evidence.path);
     if (!source) {
       if (this.active) this.queueReplacement(this.active.model);
@@ -1146,7 +1137,7 @@ export class VaultIndex {
     stored: StoredChunk,
     score: number,
     source: VaultSource,
-  ): Promise<Omit<RetrievedEvidence, "citationId"> | null> {
+  ): Promise<UncitedEvidence | null> {
     const prepared = await prepareSource(source);
     if (
       prepared.entry.status !== "indexed" ||
@@ -1158,18 +1149,10 @@ export class VaultIndex {
     const chunk = prepared.chunks.find((item) => sameLocator(stored.locator, locatorFor(source.path, item)));
     if (!chunk || !entry.fingerprint) return null;
     return {
-      ...(chunk.format === "markdown" && chunk.anchor ? { anchor: chunk.anchor } : {}),
+      ...locatorFor(source.path, chunk),
       chunkId: stored.id,
-      end: chunk.end,
-      ...(chunk.format === "markdown" ? { endLine: chunk.endLine, startLine: chunk.startLine } : {
-        excerpt: chunk.excerpt,
-        nodeId: chunk.nodeId,
-      }),
       fingerprint: entry.fingerprint,
-      format: chunk.format,
-      path: source.path,
       score,
-      start: chunk.start,
       text: chunk.text,
     };
   }
