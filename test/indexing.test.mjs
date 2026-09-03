@@ -362,7 +362,7 @@ test("startup rebuild reuses only sources with an exact signature and fingerprin
   assert.equal(generationFolders(adapter).length, 1);
 });
 
-test("questions retrieve at most four fresh sources with the generation's pinned model", async () => {
+test("questions retrieve at most six fresh sources with the generation's pinned model", async () => {
   const adapter = new MemoryAdapter();
   const texts = new Map([
     ["one.md", "0.1"],
@@ -370,6 +370,8 @@ test("questions retrieve at most four fresh sources with the generation's pinned
     ["three.md", "0.3"],
     ["four.md", "0.4"],
     ["five.md", "0.5"],
+    ["six.md", "0.6"],
+    ["seven.md", "0.7"],
   ]);
   const sources = [...texts.keys()].map((path) => ({
     path,
@@ -403,20 +405,26 @@ test("questions retrieve at most four fresh sources with the generation's pinned
   assert.deepEqual(
     evidence.map(({ citationId, path, text }) => [citationId, path, text]),
     [
-      ["S1-1", "five.md", "0.5"],
-      ["S1-2", "four.md", "0.4"],
-      ["S1-3", "three.md", "0.3"],
-      ["S1-4", "two.md", "0.2"],
+      ["S1-1", "seven.md", "0.7"],
+      ["S1-2", "six.md", "0.6"],
+      ["S1-3", "five.md", "0.5"],
+      ["S1-4", "four.md", "0.4"],
+      ["S1-5", "three.md", "0.3"],
+      ["S1-6", "two.md", "0.2"],
     ],
+  );
+  assert.deepEqual(
+    (await index.retrieve("Which source is strongest?", false)).map(({ path }) => path),
+    ["seven.md", "six.md", "five.md", "four.md"],
   );
   assert.ok(models.every((requestedModel) => requestedModel === model));
 
-  texts.set("five.md", "changed after indexing");
+  texts.set("seven.md", "changed after indexing");
   const freshEvidence = await index.retrieve("Which source is strongest?");
 
   assert.deepEqual(
     freshEvidence.map(({ path }) => path),
-    ["four.md", "three.md", "two.md", "one.md"],
+    ["six.md", "five.md", "four.md", "three.md", "two.md", "one.md"],
   );
   assert.deepEqual(validatedModels, [model, model]);
   assert.equal(index.getSnapshot().phase, "indexing");

@@ -987,7 +987,7 @@ export class VaultIndex {
         continue;
       }
       evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
-      if (evidence.length === 4) break;
+      if (evidence.length === (applyCalibratedCutoff ? 6 : 4)) break;
     }
     if (stale) this.queueReplacement(active.model);
     return evidence;
