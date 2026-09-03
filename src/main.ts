@@ -1170,6 +1170,8 @@ export default class LLMvaultPlugin extends Plugin {
     selectedConversationId: null,
   };
   private dataWrite: Promise<void> = Promise.resolve();
+  // Owned by deletion, so an older queued save cannot release the immediate stop.
+  private deletionBarrier = false;
   private deletionPending = false;
   private deleteOperation?: Promise<void>;
   private index?: VaultIndex;
@@ -1279,18 +1281,16 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   isStopped(): boolean {
-    return this.stopped;
+    return this.deletionBarrier || this.stopped;
   }
 
   isDeletionIncomplete(): boolean {
-    return this.deletionPending;
+    return this.deletionBarrier || this.deletionPending;
   }
 
   async saveSettings(settings: LLMvaultSettings): Promise<void> {
     const normalized = normalizeSettings(settings);
-    await this.updateData(() => {
-      this.llmvaultSettings = normalized;
-    });
+    await this.updateData(() => ({ llmvaultSettings: normalized }));
   }
 
   getConversationState(): ConversationState {
@@ -1314,38 +1314,38 @@ export default class LLMvaultPlugin extends Plugin {
       status: "complete",
     };
     const id = globalThis.crypto.randomUUID();
-    await this.updateData(() => {
-      this.conversationState = completeTurn(
+    await this.updateData(() => ({
+      conversationState: completeTurn(
         this.conversationState,
         conversationId,
         completed,
         id,
-      );
-    });
+      ),
+    }));
   }
 
   async startNewConversation(): Promise<void> {
     this.requireRunning();
     this.abortAnswerRequests();
-    await this.updateData(() => {
-      this.conversationState = newConversation(this.conversationState);
-    });
+    await this.updateData(() => ({
+      conversationState: newConversation(this.conversationState),
+    }));
   }
 
   async selectConversation(id: string): Promise<void> {
     this.requireRunning();
     this.abortAnswerRequests();
-    await this.updateData(() => {
-      this.conversationState = selectConversation(this.conversationState, id);
-    });
+    await this.updateData(() => ({
+      conversationState: selectConversation(this.conversationState, id),
+    }));
   }
 
   async deleteConversation(id: string): Promise<void> {
     this.requireRunning();
     if (this.conversationState.selectedConversationId === id) this.abortAnswerRequests();
-    await this.updateData(() => {
-      this.conversationState = deleteConversation(this.conversationState, id);
-    });
+    await this.updateData(() => ({
+      conversationState: deleteConversation(this.conversationState, id),
+    }));
   }
 
   discoverModels(port: number): Promise<OllamaDiscovery> {
@@ -1374,7 +1374,7 @@ export default class LLMvaultPlugin extends Plugin {
     now = new Date(),
     timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
   ): Promise<RetrievedEvidence[]> {
-    if (this.stopped || !this.index) return [];
+    if (this.isStopped() || !this.index) return [];
     const request = this.dailyRecapRequest(question, now, timeZone);
     if (!request) return this.index.retrieve(question);
     if (!request.targetPath) return [];
@@ -1428,7 +1428,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
-    if (this.stopped) return null;
+    if (this.isStopped()) return null;
     const current = await (this.index?.resolveEvidence(evidence) ?? Promise.resolve(null));
     return current && this.evidenceFile(current) ? current : null;
   }
@@ -1458,27 +1458,30 @@ export default class LLMvaultPlugin extends Plugin {
     return file instanceof TFile && file.extension.toLowerCase() === extension ? file : null;
   }
 
-  private updateData(update: () => void): Promise<void> {
+  private updateData(update: () => {
+    llmvaultSettings?: LLMvaultSettings;
+    conversationState?: ConversationState;
+    deletionPending?: boolean;
+    stopped?: boolean;
+  }): Promise<void> {
     const operation = this.dataWrite.then(async () => {
-      const priorSettings = this.llmvaultSettings;
-      const priorConversations = this.conversationState;
-      const priorDeletionPending = this.deletionPending;
-      const priorStopped = this.stopped;
-      update();
-      try {
-        await this.saveData({
-          ...this.llmvaultSettings,
-          ...this.conversationState,
-          vaultChatDeletionPending: this.deletionPending,
-          vaultChatStopped: this.stopped,
-        });
-      } catch (error) {
-        this.llmvaultSettings = priorSettings;
-        this.conversationState = priorConversations;
-        this.deletionPending = priorDeletionPending;
-        this.stopped = priorStopped;
-        throw error;
-      }
+      const proposed = {
+        llmvaultSettings: this.llmvaultSettings,
+        conversationState: this.conversationState,
+        deletionPending: this.isDeletionIncomplete(),
+        stopped: this.isStopped(),
+        ...update(),
+      };
+      await this.saveData({
+        ...proposed.llmvaultSettings,
+        ...proposed.conversationState,
+        vaultChatDeletionPending: proposed.deletionPending,
+        vaultChatStopped: proposed.stopped,
+      });
+      this.llmvaultSettings = proposed.llmvaultSettings;
+      this.conversationState = proposed.conversationState;
+      this.deletionPending = proposed.deletionPending;
+      this.stopped = proposed.stopped;
     });
     this.dataWrite = operation.then(
       () => undefined,
@@ -1511,7 +1514,7 @@ export default class LLMvaultPlugin extends Plugin {
     embeddingModel: string,
     rebuild = false,
   ): Promise<void> {
-    if (this.stopped) return;
+    if (this.isStopped()) return;
     const digest = discovery.modelDigests[embeddingModel];
     if (!this.index || !digest) {
       this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
@@ -1533,28 +1536,30 @@ export default class LLMvaultPlugin extends Plugin {
     embeddingModel: string,
   ): Promise<void> {
     if (this.deleteOperation) throw new Error("vault_chat_deletion_in_progress");
-    if (this.deletionPending) throw new Error("vault_chat_deletion_incomplete");
-    if (this.stopped) {
-      await this.updateData(() => { this.stopped = false; });
+    if (this.isDeletionIncomplete()) throw new Error("vault_chat_deletion_incomplete");
+    if (this.isStopped()) {
+      await this.updateData(() => ({ stopped: false }));
     }
     void this.startIndexing(discovery, embeddingModel);
   }
 
   deleteAllData(): Promise<void> {
     if (this.deleteOperation) return this.deleteOperation;
-    this.stopped = true;
-    this.deletionPending = true;
+    this.deletionBarrier = true;
     this.index?.cancel();
     this.indexOllama.abortAll();
     this.chatOllama.abortAll();
     this.ollama.abortAll();
     this.queryOllama.abortAll();
     const operation = (async () => {
-      await this.updateData(() => {
-        this.conversationState = { conversations: [], selectedConversationId: null };
-      });
+      await this.updateData(() => ({
+        conversationState: { conversations: [], selectedConversationId: null },
+        deletionPending: true,
+        stopped: true,
+      }));
       await this.index?.deleteAll();
-      await this.updateData(() => { this.deletionPending = false; });
+      await this.updateData(() => ({ deletionPending: false }));
+      this.deletionBarrier = false;
     })();
     this.deleteOperation = operation;
     operation.then(
@@ -1605,7 +1610,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   private handleVaultMutation(file: TAbstractFile, oldPath?: string): void {
-    if (this.stopped) return;
+    if (this.isStopped()) return;
     if (!(file instanceof TFile)) return;
     const paths = new Set(
       [oldPath, file.path].filter(
@@ -1635,7 +1640,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   private async restoreIndex(rebuild = false): Promise<void> {
-    if (this.stopped) return;
+    if (this.isStopped()) return;
     const settings = this.getSettings();
     if (!settings.embeddingModel) return;
     try {
@@ -1660,6 +1665,6 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   private requireRunning(): void {
-    if (this.stopped || this.deleteOperation) throw new Error("vault_chat_stopped");
+    if (this.isStopped() || this.deleteOperation) throw new Error("vault_chat_stopped");
   }
 }

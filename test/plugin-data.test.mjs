@@ -98,6 +98,110 @@ test("delete all persists its gate before removal and leaves failures retryable"
   assert.equal(saves.at(-1).vaultChatDeletionPending, false);
 });
 
+test("an older settings save failure cannot undo deletion's stop barrier", async () => {
+  const Plugin = await loadPlugin();
+  const plugin = new Plugin();
+  const originalSettings = plugin.getSettings();
+  const saveStarted = Promise.withResolvers();
+  const pendingSave = Promise.withResolvers();
+  let persisted;
+  let saves = 0;
+  plugin.saveData = async (data) => {
+    if (++saves === 1) {
+      saveStarted.resolve();
+      await pendingSave.promise;
+    }
+    persisted = structuredClone(data);
+  };
+  plugin.index = { cancel() {}, async deleteAll() {} };
+
+  const settingsSave = plugin.saveSettings({ ...originalSettings, chatModel: "changed" });
+  const settingsFailure = assert.rejects(settingsSave, /save failed/);
+  await saveStarted.promise;
+  assert.deepEqual(plugin.getSettings(), originalSettings);
+  const deletion = plugin.deleteAllData();
+  assert.equal(plugin.isStopped(), true);
+  pendingSave.reject(new Error("save failed"));
+  await settingsFailure;
+  await deletion;
+
+  assert.deepEqual({
+    stopped: plugin.isStopped(),
+    persistedStopped: persisted.vaultChatStopped,
+    pending: plugin.isDeletionIncomplete(),
+    persistedPending: persisted.vaultChatDeletionPending,
+  }, { stopped: true, persistedStopped: true, pending: false, persistedPending: false });
+  assert.deepEqual(plugin.getSettings(), originalSettings);
+  await assert.rejects(plugin.startNewConversation(), /vault_chat_stopped/);
+});
+
+test("an in-flight resume cannot release a newer deletion barrier", async () => {
+  const Plugin = await loadPlugin();
+  const plugin = new Plugin();
+  plugin.stopped = true;
+  const resumeStarted = Promise.withResolvers();
+  const resumeSave = Promise.withResolvers();
+  const deletionStarted = Promise.withResolvers();
+  const deletionSave = Promise.withResolvers();
+  const saves = [];
+  plugin.saveData = async (data) => {
+    saves.push(structuredClone(data));
+    if (saves.length === 1) {
+      resumeStarted.resolve();
+      await resumeSave.promise;
+    } else if (saves.length === 2) {
+      deletionStarted.resolve();
+      await deletionSave.promise;
+    }
+  };
+  let starts = 0;
+  plugin.index = { cancel() {}, async deleteAll() {}, async start() { starts += 1; } };
+  const discovery = { modelDigests: { embed: "digest" } };
+  const resume = plugin.resumeVaultChat(discovery, "embed");
+  await resumeStarted.promise;
+  assert.equal(plugin.isStopped(), true);
+  const deletion = plugin.deleteAllData();
+  resumeSave.resolve();
+  await resume;
+  await deletionStarted.promise;
+  assert.equal(plugin.isStopped(), true);
+  assert.equal(plugin.isDeletionIncomplete(), true);
+  assert.deepEqual(await plugin.retrieve("question"), []);
+  assert.equal(starts, 0);
+  deletionSave.resolve();
+  await deletion;
+  assert.equal(plugin.isStopped(), true);
+  assert.equal(saves.at(-1).vaultChatStopped, true);
+  await plugin.resumeVaultChat(discovery, "embed");
+  assert.equal(plugin.isStopped(), false);
+  assert.equal(starts, 1);
+});
+
+for (const failedSave of [1, 2]) {
+  test(`deletion remains stopped and retryable when persistence step ${failedSave} fails`, async () => {
+    const Plugin = await loadPlugin();
+    const plugin = new Plugin();
+    let saves = 0;
+    let deletions = 0;
+    let persisted;
+    plugin.saveData = async (data) => {
+      if (++saves === failedSave) throw new Error("save failed");
+      persisted = structuredClone(data);
+    };
+    plugin.index = { cancel() {}, async deleteAll() { deletions += 1; } };
+    await assert.rejects(plugin.deleteAllData(), /save failed/);
+    assert.equal(deletions, failedSave - 1);
+    assert.equal(plugin.isStopped(), true);
+    assert.equal(plugin.isDeletionIncomplete(), true);
+    await assert.rejects(plugin.resumeVaultChat({}, "embed"), /deletion_incomplete/);
+    await plugin.deleteAllData();
+    assert.equal(plugin.isStopped(), true);
+    assert.equal(plugin.isDeletionIncomplete(), false);
+    assert.equal(persisted.vaultChatStopped, true);
+    assert.equal(persisted.vaultChatDeletionPending, false);
+  });
+}
+
 test("Daily Recap uses one metadata-link layer and bypasses semantic retrieval", async () => {
   const Plugin = await loadPlugin();
   const plugin = new Plugin();
