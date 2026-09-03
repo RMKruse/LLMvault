@@ -10,7 +10,7 @@
     "build": "npm run typecheck && node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test:unit": "node --experimental-strip-types --test test/ollama.test.mjs test/indexing.test.mjs test/conversations.test.mjs test/plugin-data.test.mjs test/security.test.mjs test/quality.test.mjs test/acceptance.test.mjs",
+    "test:unit": "node --experimental-strip-types --test test/ollama.test.mjs test/indexing.test.mjs test/conversations.test.mjs test/plugin-data.test.mjs test/security.test.mjs test/quality.test.mjs test/acceptance.test.mjs test/answer-workflow.test.mjs",
     "test:smoke": "npm run build && node --test test/plugin-smoke.test.mjs",
     "test": "npm run test:unit && npm run test:smoke && node evaluation/proof.mjs --record-tests",
     "quality:manifest": "node evaluation/reference-vault-v1/build-manifest.mjs --check",

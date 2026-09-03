@@ -27,13 +27,13 @@ import {
   type ConversationState,
   completeTurn,
   conversationMessages,
-  conversationUserMessage,
   deleteConversation,
   newConversation,
   normalizeConversationState,
   selectConversation,
 } from "./conversations";
-import { answerParts, GROUNDING_SYSTEM_PROMPT } from "./quality.ts";
+import { answerParts } from "./quality.ts";
+import { executeAnswer, type AnswerRequest, type AnswerResult } from "./answer.ts";
 
 const VIEW_TYPE_VAULT_CHAT = "vault-chat-view";
 
@@ -84,8 +84,9 @@ class VaultChatView extends ItemView {
   private managementOpen: boolean;
   private mutationUnsubscribe?: () => void;
   private questionEl?: HTMLTextAreaElement;
-  private requestGeneration = 0;
+  private answerGeneration = 0;
   private portValue: string;
+  private setupGeneration = 0;
   private setupEl?: HTMLElement;
   private status = "Checking the local Ollama connection…";
   private readonly unavailableCitations = new Set<string>();
@@ -122,7 +123,8 @@ class VaultChatView extends ItemView {
     this.indexUnsubscribe = this.plugin.subscribeIndex((snapshot) => {
       this.renderIndex();
       if (this.plugin.isStopped()) {
-        this.requestGeneration += 1;
+        if (this.deletionState !== "deleting") this.cancelSetup();
+        this.answerGeneration += 1;
         this.displayGeneration += 1;
         this.answering = false;
         this.historyOpen = false;
@@ -143,7 +145,10 @@ class VaultChatView extends ItemView {
   }
 
   override onClose(): Promise<void> {
-    this.requestGeneration += 1;
+    this.cancelSetup();
+    this.displayGeneration += 1;
+    this.answering = false;
+    this.answerGeneration += 1;
     this.plugin.abortAnswerRequests();
     this.indexUnsubscribe?.();
     this.mutationUnsubscribe?.();
@@ -344,7 +349,7 @@ class VaultChatView extends ItemView {
   }
 
   private cancelAnswer(): void {
-    this.requestGeneration += 1;
+    this.answerGeneration += 1;
     this.plugin.abortAnswerRequests();
     if (this.answering) this.renderIncomplete();
     this.answering = false;
@@ -505,27 +510,20 @@ class VaultChatView extends ItemView {
   private async askQuestion(): Promise<void> {
     const question = this.questionEl?.value.trim() ?? "";
     if (!question) return;
-    const requestedAt = new Date();
-    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const dailyRecap = this.plugin.dailyRecapRequest(question, requestedAt, timeZone);
-
     const conversationId = this.plugin.getConversationState().selectedConversationId;
     this.displayGeneration += 1;
-    const requestGeneration = ++this.requestGeneration;
-    this.plugin.abortAnswerRequests();
+    const answerGeneration = ++this.answerGeneration;
     this.answering = true;
     this.renderComposerState();
     this.renderAnswer("Finding current evidence…", "Answering…", question);
 
     try {
-      await this.plugin.validateChatModel();
-      if (requestGeneration !== this.requestGeneration) return;
-      const retrieved = await this.plugin.retrieve(question, requestedAt, timeZone);
-      if (requestGeneration !== this.requestGeneration) return;
-      const evidence = await this.plugin.revalidateEvidence(retrieved);
-      if (requestGeneration !== this.requestGeneration) return;
-      this.renderEvidence(evidence);
-      if (evidence.length !== retrieved.length) {
+      const result = await this.plugin.answerQuestion(question, conversationId, {
+        onEvidence: (evidence) => this.renderEvidence(evidence),
+        onContent: (content) => this.renderAnswer(content, "Answering…", question),
+      });
+      if (answerGeneration !== this.answerGeneration) return;
+      if (result.status === "evidence_changed") {
         this.renderAnswer(
           "A selected source changed before chat started. The index is rebuilding; retry the question when it is ready.",
           "Evidence changed",
@@ -533,57 +531,10 @@ class VaultChatView extends ItemView {
         );
         return;
       }
-      if (evidence.length === 0) {
-        const message = "The available Vault Content is insufficient for this question. Revise the question or rebuild the index.";
-        await this.plugin.saveCompletedTurn(conversationId, {
-          answer: message,
-          evidence: [],
-          kind: "insufficient",
-          question,
-        });
-        if (requestGeneration !== this.requestGeneration) return;
-        this.renderInsufficient(message);
-        this.renderHistory();
-        return;
-      }
-
-      let streamed = "";
-      this.renderAnswer(streamed, "Answering…", question);
-      const userMessage = conversationUserMessage(question, evidence, dailyRecap?.date);
-      const messages: OllamaMessage[] = [
-        { role: "system", content: GROUNDING_SYSTEM_PROMPT },
-        ...this.plugin.getConversationMessages(conversationId),
-        userMessage,
-      ];
-      const result = await this.plugin.chat(messages, (content) => {
-        if (requestGeneration !== this.requestGeneration) return;
-        streamed += content;
-        this.renderAnswer(streamed, "Answering…", question);
-      });
-      if (requestGeneration !== this.requestGeneration) return;
-
-      const insufficient = result.content.match(/^\s*INSUFFICIENT_EVIDENCE:\s*([\s\S]*)$/);
-      if (insufficient || result.content.trim().length === 0) {
-        const message =
-          insufficient?.[1]?.trim() ||
-          "The available Vault Content is insufficient for this question.";
-        await this.plugin.saveCompletedTurn(conversationId, {
-          answer: message,
-          evidence,
-          kind: "insufficient",
-          question,
-        });
-        if (requestGeneration !== this.requestGeneration) return;
-        this.renderInsufficient(message);
+      if (result.turn.kind === "insufficient") {
+        this.renderInsufficient(result.turn.answer);
       } else {
-        await this.plugin.saveCompletedTurn(conversationId, {
-          answer: result.content,
-          evidence,
-          kind: "answer",
-          question,
-        });
-        if (requestGeneration !== this.requestGeneration) return;
-        this.renderAnswer(result.content, undefined, question);
+        this.renderAnswer(result.turn.answer, undefined, question);
         if (this.questionEl) this.questionEl.value = "";
       }
       this.renderHistory();
@@ -593,7 +544,7 @@ class VaultChatView extends ItemView {
       );
       if (selected) this.conversationTitleEl?.setText(selected.title);
     } catch (error) {
-      if (requestGeneration !== this.requestGeneration) return;
+      if (answerGeneration !== this.answerGeneration) return;
       if (error instanceof OllamaError && error.code === "canceled") {
         this.renderIncomplete();
       } else {
@@ -604,7 +555,7 @@ class VaultChatView extends ItemView {
         );
       }
     } finally {
-      if (requestGeneration === this.requestGeneration) {
+      if (answerGeneration === this.answerGeneration) {
         this.answering = false;
         this.renderComposerState();
       }
@@ -628,7 +579,7 @@ class VaultChatView extends ItemView {
 
   private vaultContentChanged(paths: ReadonlySet<string>): void {
     if (this.answering) {
-      this.requestGeneration += 1;
+      this.answerGeneration += 1;
       this.answering = false;
       this.renderAnswer(
         "Vault Content changed while this answer was running. Its evidence is no longer current; retry when indexing is ready.",
@@ -941,7 +892,9 @@ class VaultChatView extends ItemView {
   }
 
   private async deleteAllData(): Promise<void> {
-    this.requestGeneration += 1;
+    this.cancelSetup();
+    const setupGeneration = this.setupGeneration;
+    this.answerGeneration += 1;
     this.displayGeneration += 1;
     this.deletionState = "deleting";
     this.managementOpen = true;
@@ -955,6 +908,7 @@ class VaultChatView extends ItemView {
     this.renderComposerState();
     try {
       await this.plugin.deleteAllData();
+      if (setupGeneration !== this.setupGeneration) return;
       const settings = this.plugin.getSettings();
       this.portValue = String(settings.ollamaPort);
       this.chatModel = settings.chatModel;
@@ -966,11 +920,14 @@ class VaultChatView extends ItemView {
       this.renderHistory();
       this.deletionState = "complete";
     } catch {
+      if (setupGeneration !== this.setupGeneration) return;
       this.deletionState = "failed";
     } finally {
-      this.busy = false;
-      this.renderSetup();
-      this.renderIndex();
+      if (setupGeneration === this.setupGeneration) {
+        this.busy = false;
+        this.renderSetup();
+        this.renderIndex();
+      }
     }
   }
 
@@ -999,6 +956,12 @@ class VaultChatView extends ItemView {
     return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
   }
 
+  private cancelSetup(): void {
+    this.setupGeneration += 1;
+    this.plugin.abortOllamaRequests();
+    this.busy = false;
+  }
+
   private async refreshModels(): Promise<void> {
     const port = this.port();
     if (port === null) {
@@ -1007,7 +970,7 @@ class VaultChatView extends ItemView {
       return;
     }
 
-    const requestGeneration = ++this.requestGeneration;
+    const setupGeneration = ++this.setupGeneration;
     this.plugin.abortOllamaRequests();
     this.busy = true;
     this.status = "Checking Ollama and installed model capabilities…";
@@ -1015,7 +978,7 @@ class VaultChatView extends ItemView {
 
     try {
       const discovery = await this.plugin.discoverModels(port);
-      if (requestGeneration !== this.requestGeneration) return;
+      if (setupGeneration !== this.setupGeneration) return;
       this.discovery = discovery;
 
       const saved = this.plugin.getSettings();
@@ -1037,13 +1000,14 @@ class VaultChatView extends ItemView {
       ) {
         await this.plugin.saveSettings(revalidated.settings);
       }
+      if (setupGeneration !== this.setupGeneration) return;
       this.status = this.discoveryStatus(revalidated.recoveryCodes);
     } catch (error) {
-      if (requestGeneration !== this.requestGeneration) return;
+      if (setupGeneration !== this.setupGeneration) return;
       this.discovery = null;
       this.status = this.errorMessage(error);
     } finally {
-      if (requestGeneration === this.requestGeneration) {
+      if (setupGeneration === this.setupGeneration) {
         this.busy = false;
         this.renderSetup();
       }
@@ -1067,7 +1031,7 @@ class VaultChatView extends ItemView {
       return;
     }
 
-    const requestGeneration = ++this.requestGeneration;
+    const setupGeneration = ++this.setupGeneration;
     this.plugin.abortOllamaRequests();
     this.busy = true;
     this.status = "Revalidating both Local Models…";
@@ -1075,7 +1039,7 @@ class VaultChatView extends ItemView {
 
     try {
       const chat = await this.plugin.validateModel(port, chatModel, "completion");
-      if (requestGeneration !== this.requestGeneration) return;
+      if (setupGeneration !== this.setupGeneration) return;
       if (chat !== "compatible") {
         this.chatModel = null;
         const saved = this.plugin.getSettings();
@@ -1085,6 +1049,7 @@ class VaultChatView extends ItemView {
           embeddingModel:
             saved.ollamaPort === port ? saved.embeddingModel : null,
         });
+        if (setupGeneration !== this.setupGeneration) return;
         this.status = RECOVERY_MESSAGES[
           chat === "remote"
             ? "remote_model_disallowed"
@@ -1098,7 +1063,7 @@ class VaultChatView extends ItemView {
         embeddingModel,
         "embedding",
       );
-      if (requestGeneration !== this.requestGeneration) return;
+      if (setupGeneration !== this.setupGeneration) return;
       if (embedding !== "compatible") {
         this.embeddingModel = null;
         await this.plugin.saveSettings({
@@ -1106,6 +1071,7 @@ class VaultChatView extends ItemView {
           chatModel,
           embeddingModel: null,
         });
+        if (setupGeneration !== this.setupGeneration) return;
         this.status = RECOVERY_MESSAGES[
           embedding === "remote"
             ? "remote_model_disallowed"
@@ -1115,14 +1081,16 @@ class VaultChatView extends ItemView {
       }
 
       await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel });
+      if (setupGeneration !== this.setupGeneration) return;
       this.status = "Setup complete. Both Local Models are compatible; indexing is starting.";
       await this.plugin.resumeVaultChat(this.discovery, embeddingModel);
+      if (setupGeneration !== this.setupGeneration) return;
       this.showChat();
     } catch (error) {
-      if (requestGeneration !== this.requestGeneration) return;
+      if (setupGeneration !== this.setupGeneration) return;
       this.status = this.errorMessage(error);
     } finally {
-      if (requestGeneration === this.requestGeneration) {
+      if (setupGeneration === this.setupGeneration) {
         this.busy = false;
         this.renderSetup();
       }
@@ -1165,6 +1133,7 @@ class VaultChatView extends ItemView {
 }
 
 export default class LLMvaultPlugin extends Plugin {
+  private answerController?: AbortController;
   private conversationState: ConversationState = {
     conversations: [],
     selectedConversationId: null,
@@ -1270,9 +1239,8 @@ export default class LLMvaultPlugin extends Plugin {
   override onunload(): void {
     this.index?.cancel();
     this.indexOllama.abortAll();
-    this.chatOllama.abortAll();
+    this.abortAnswerRequests();
     this.ollama.abortAll();
-    this.queryOllama.abortAll();
     void this.app.workspace.detachLeavesOfType(VIEW_TYPE_VAULT_CHAT);
   }
 
@@ -1303,9 +1271,39 @@ export default class LLMvaultPlugin extends Plugin {
     );
   }
 
+  async answerQuestion(
+    question: string,
+    conversationId: string | null,
+    callbacks: Pick<AnswerRequest, "onEvidence" | "onContent">,
+  ): Promise<AnswerResult> {
+    this.abortAnswerRequests();
+    const controller = new AbortController();
+    this.answerController = controller;
+    const requestedAt = new Date();
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const result = await executeAnswer(this, {
+        question, requestedAt, timeZone,
+        history: this.getConversationMessages(conversationId),
+        dailyRecapDate: this.dailyRecapRequest(question, requestedAt, timeZone)?.date,
+        signal: controller.signal,
+        ...callbacks,
+      });
+      controller.signal.throwIfAborted();
+      if (result.status === "complete") {
+        await this.saveCompletedTurn(conversationId, result.turn, controller.signal);
+      }
+      controller.signal.throwIfAborted();
+      return result;
+    } finally {
+      if (this.answerController === controller) this.answerController = undefined;
+    }
+  }
+
   async saveCompletedTurn(
     conversationId: string | null,
     turn: Omit<CompletedTurn, "completedAt" | "status">,
+    signal?: AbortSignal,
   ): Promise<void> {
     this.requireRunning();
     const completed: CompletedTurn = {
@@ -1314,14 +1312,13 @@ export default class LLMvaultPlugin extends Plugin {
       status: "complete",
     };
     const id = globalThis.crypto.randomUUID();
-    await this.updateData(() => ({
-      conversationState: completeTurn(
-        this.conversationState,
-        conversationId,
-        completed,
-        id,
-      ),
-    }));
+    await this.updateData(() => {
+      signal?.throwIfAborted();
+      this.requireRunning();
+      return {
+        conversationState: completeTurn(this.conversationState, conversationId, completed, id),
+      };
+    });
   }
 
   async startNewConversation(): Promise<void> {
@@ -1365,6 +1362,7 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   abortAnswerRequests(): void {
+    this.answerController?.abort(new OllamaError("canceled", "/api/chat"));
     this.chatOllama.abortAll();
     this.queryOllama.abortAll();
   }
@@ -1548,9 +1546,8 @@ export default class LLMvaultPlugin extends Plugin {
     this.deletionBarrier = true;
     this.index?.cancel();
     this.indexOllama.abortAll();
-    this.chatOllama.abortAll();
+    this.abortAnswerRequests();
     this.ollama.abortAll();
-    this.queryOllama.abortAll();
     const operation = (async () => {
       await this.updateData(() => ({
         conversationState: { conversations: [], selectedConversationId: null },

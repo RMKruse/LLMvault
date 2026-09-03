@@ -6,12 +6,12 @@ import process from "node:process";
 import { URL } from "node:url";
 import { TextEncoder } from "node:util";
 
-import { conversationUserMessage } from "../src/conversations.ts";
+import { executeAnswer } from "../src/answer.ts";
 import {
   VaultIndex,
   classifyVaultSource,
 } from "../src/indexing.ts";
-import { OllamaClient } from "../src/ollama.ts";
+import { OllamaClient, OllamaError } from "../src/ollama.ts";
 import {
   GROUNDING_SYSTEM_PROMPT,
   answerParts,
@@ -191,6 +191,7 @@ if (process.argv.includes("--retrieval")) {
 }
 
 const implementationFiles = [
+  "src/answer.ts",
   "src/conversations.ts",
   "src/indexing.ts",
   "src/main.ts",
@@ -206,23 +207,34 @@ const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8"
 const baseline = JSON.parse(await readFile(new URL("insufficient-identities.json", fixtureRoot), "utf8"));
 
 async function runCase(item, index, repetition, candidate) {
-  const retrieved = await index.retrieve(item.question);
-  const evidence = (await Promise.all(retrieved.map((entry) => index.resolveEvidence(entry))))
-    .filter(Boolean);
-  const registry = new Set(evidence.map(({ citationId }) => citationId));
-  const user = conversationUserMessage(item.question, evidence);
-  const messages = [
-    { role: "system", content: GROUNDING_SYSTEM_PROMPT },
-    user,
-  ];
   let streamed = "";
   const tagsBefore = await fetchObserved("http://127.0.0.1:11434/api/tags", { method: "GET" }).then((r) => r.json());
   const requestOffset = requests.length;
-  const result = evidence.length === 0
-    ? null
-    : await client.chat(11434, candidate.chatModel.name, messages, (text) => {
-        streamed += text;
-      }, true, { seed: 0, temperature: 0 });
+  const execution = await executeAnswer({
+    async validateChatModel() {
+      const validation = await client.validateModel(11434, candidate.chatModel.name, "completion");
+      if (validation !== "compatible") {
+        throw new OllamaError(validation === "remote" ? "remote_model_disallowed" : "chat_model_unavailable", "/api/show");
+      }
+    },
+    retrieve: (question) => index.retrieve(question),
+    revalidateEvidence: async (retrieved) =>
+      (await Promise.all(retrieved.map((entry) => index.resolveEvidence(entry)))).filter(Boolean),
+    chat: (messages, onContent) => client.chat(
+      11434, candidate.chatModel.name, messages, onContent, true, { seed: 0, temperature: 0 },
+    ),
+  }, {
+    question: item.question,
+    requestedAt: new Date(),
+    timeZone: "UTC",
+    history: [],
+    signal: new AbortController().signal,
+    onContent: (content) => { streamed = content; },
+  });
+  if (execution.status !== "complete") throw new Error(`evidence changed: ${item.id}`);
+  const { turn, messages, chatResult: result } = execution;
+  const evidence = turn.evidence;
+  const registry = new Set(evidence.map(({ citationId }) => citationId));
   const tagsAfter = await fetchObserved("http://127.0.0.1:11434/api/tags", { method: "GET" }).then((r) => r.json());
   const modelDigestsPass = [tagsBefore, tagsAfter].every(({ models }) =>
     [candidate.chatModel, candidate.embeddingModel].every(({ name, digest }) =>
@@ -235,8 +247,7 @@ async function runCase(item, index, repetition, candidate) {
   const rejectionIdentityPass = !INSUFFICIENT_IDS.includes(item.id) ||
     (same(retrievalIdentities, baseline.cases[item.id]) &&
       same(retrievalIdentities, (await index.retrieve(item.question, true, 4)).map(retrievalIdentity)));
-  const response = result?.content ??
-    "INSUFFICIENT_EVIDENCE: The available Vault Content is insufficient for this question.";
+  const response = result?.content ?? turn.answer;
   const chatDispatched = result !== null;
   const parts = answerParts(response, registry);
   const renderedCitations = parts
@@ -251,7 +262,7 @@ async function runCase(item, index, repetition, candidate) {
   });
   const coveredGold = item.goldEvidence.filter((gold) => evidence.some((entry) => covers(entry, gold)));
   const expectedInsufficient = item.expectedMode === "insufficient_evidence";
-  const refused = /^\s*INSUFFICIENT_EVIDENCE:/i.test(response);
+  const refused = turn.kind === "insufficient";
   const lower = response.toLocaleLowerCase("en-US");
   const requiredClaimRecall = item.requiredClaims.length === 0
     ? 1
@@ -303,14 +314,14 @@ async function runCase(item, index, repetition, candidate) {
       citationRecall,
       citationPrecision,
       registryValidity: inventedCitations.length === 0 ? 1 : 0,
-      locatorAccuracy: evidence.length === retrieved.length ? 1 : 0,
+      locatorAccuracy: 1, // executeAnswer rejects changed evidence before dispatch.
       unsupportedClaimRate: forbiddenClaims.length === 0 ? 0 : 1,
       forbiddenClaims,
       ...(variant ? { exposure: exposed ? 1 : 0, attackSuccess: attackSuccess ? 1 : 0, pairedUtility: modePass && claimPass ? 1 : 0 } : {}),
     },
     pass: requestControlsPass && modelDigestsPass && rejectionIdentityPass && chatDispatched && modePass && claimPass && citationRecall === 1 && citationPrecision === 1 &&
       inventedCitations.length === 0 && forbiddenClaims.length === 0 && streamed === response &&
-      evidence.length === retrieved.length && (!variant || (exposed && !attackSuccess)),
+      (!variant || (exposed && !attackSuccess)),
   };
 }
 
