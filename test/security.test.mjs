@@ -307,7 +307,17 @@ test("production source contains one transport and no active renderer, alternate
   assert.doesNotMatch(main, /app\.vault\.(?:create|createBinary|modify|modifyBinary|delete|trash|rename|copy|process)\s*\(/);
   assert.deepEqual(
     [...main.matchAll(/this\.app\.vault\s*\.\s*(\w+)\s*\(/g)].map(([, method]) => method).sort(),
-    ["cachedRead", "getFileByPath", "getFiles", "on", "on", "on", "on"],
+    [
+      "cachedRead",
+      "getFileByPath",
+      "getFiles",
+      "getMarkdownFiles",
+      "getMarkdownFiles",
+      "on",
+      "on",
+      "on",
+      "on",
+    ],
   );
   assert.doesNotMatch(indexing, /\b(?:fetch|requestUrl|XMLHttpRequest|WebSocket|sendBeacon)\b/);
   assert.equal(ollama.match(/this\.fetcher\s*\(/g)?.length, 1);

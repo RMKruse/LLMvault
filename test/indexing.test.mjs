@@ -13,6 +13,7 @@ import {
   chunkMarkdown,
   classifyVaultSource,
   encodeVector,
+  resolveDailyRecapRequest,
 } from "../src/indexing.ts";
 
 class MemoryAdapter {
@@ -124,6 +125,59 @@ test("oversized Markdown lines split at Unicode code-point boundaries", () => {
 test("only Obsidian-confirmed headings and blocks become citation anchors", () => {
   const source = "```md\n# Not a heading\n^not-a-block\n```";
   assert.ok(chunkMarkdown(source).every(({ anchor }) => anchor === undefined));
+});
+
+test("Daily Recap requests resolve an exact local-date note or fail closed", () => {
+  const paths = [
+    "Labortagebuch/2026.09.01.md",
+    "Labortagebuch/2026.09.02.md",
+  ];
+
+  assert.deepEqual(
+    resolveDailyRecapRequest(
+      "fasse mir zusammen was ich gestern gemacht habe",
+      new Date("2026-09-03T10:00:00Z"),
+      "Europe/Berlin",
+      paths,
+    ),
+    { date: "2026.09.02", targetPath: "Labortagebuch/2026.09.02.md" },
+  );
+  assert.deepEqual(
+    resolveDailyRecapRequest(
+      "summary of yesterday",
+      new Date("2026-09-03T00:30:00Z"),
+      "America/Los_Angeles",
+      paths,
+    ),
+    { date: "2026.09.01", targetPath: "Labortagebuch/2026.09.01.md" },
+  );
+  assert.deepEqual(
+    resolveDailyRecapRequest(
+      "summary of today",
+      new Date("2026-09-03T10:00:00Z"),
+      "Europe/Berlin",
+      paths,
+    ),
+    { date: "2026.09.03" },
+  );
+  assert.deepEqual(
+    resolveDailyRecapRequest(
+      "summary of yesterday",
+      new Date("2026-09-03T10:00:00Z"),
+      "Europe/Berlin",
+      [...paths, "Archive/2026.09.02.md"],
+    ),
+    { date: "2026.09.02" },
+  );
+  assert.equal(
+    resolveDailyRecapRequest(
+      "what happened yesterday?",
+      new Date("2026-09-03T10:00:00Z"),
+      "Europe/Berlin",
+      paths,
+    ),
+    null,
+  );
 });
 
 test("Canvas extraction keeps non-empty text nodes independent and ignores graph content", () => {
@@ -428,6 +482,49 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
   );
   assert.deepEqual(validatedModels, [model, model]);
   assert.equal(index.getSnapshot().phase, "indexing");
+});
+
+test("Daily Recap evidence follows exact paths once in source order without query embedding", async () => {
+  const sources = [
+    { path: "2026.09.02.md", read: async () => "daily" },
+    { path: "alpha.md", read: async () => "alpha" },
+    { path: "beta.md", read: async () => "beta" },
+    { path: "gamma.md", read: async () => "gamma" },
+    { path: "second-hop.md", read: async () => "second hop" },
+  ];
+  let queryEmbeddings = 0;
+  const index = new VaultIndex(
+    new MemoryAdapter(),
+    "plugin/index-v1",
+    () => sources,
+    async (inputs) => inputs.map(() => [1]),
+    undefined,
+    async (inputs) => {
+      queryEmbeddings += 1;
+      return inputs.map(() => [1]);
+    },
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+
+  const evidence = await index.retrievePaths([
+    "2026.09.02.md",
+    "alpha.md",
+    "alpha.md",
+    "beta.md",
+    "gamma.md",
+    "second-hop.md",
+  ]);
+
+  assert.deepEqual(
+    evidence.map(({ citationId, path, text }) => [citationId, path, text]),
+    [
+      ["S1-1", "2026.09.02.md", "daily"],
+      ["S1-2", "alpha.md", "alpha"],
+      ["S1-3", "beta.md", "beta"],
+      ["S1-4", "gamma.md", "gamma"],
+    ],
+  );
+  assert.equal(queryEmbeddings, 0);
 });
 
 test("Canvas evidence retains its node locator and application-owned preview", async () => {

@@ -101,6 +101,51 @@ export interface RetrievedEvidence {
   text: string;
 }
 
+export interface DailyRecapRequest {
+  date: string;
+  targetPath?: string;
+}
+
+const RELATIVE_DAYS: [RegExp, number][] = [
+  [/\bvorgestern\b/iu, -2],
+  [/\b(?:gestern|yesterday)\b/iu, -1],
+  [/\b(?:heute|today)\b/iu, 0],
+];
+
+const DAILY_RECAP_INTENT = /\b(?:zusammen|zusammenfass\p{L}*|recap|summary|summar\p{L}*|what did i do|was ich .* gemacht)\b/iu;
+
+export function resolveDailyRecapRequest(
+  question: string,
+  now: Date,
+  timeZone: string,
+  markdownPaths: string[],
+): DailyRecapRequest | null {
+  const relativeDay = RELATIVE_DAYS.find(([pattern]) => pattern.test(question));
+  if (!relativeDay || !DAILY_RECAP_INTENT.test(question)) return null;
+
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      day: "2-digit",
+      month: "2-digit",
+      timeZone,
+      year: "numeric",
+    }).formatToParts(now).map(({ type, value }) => [type, value]),
+  );
+  const shifted = new Date(Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day) + relativeDay[1],
+  ));
+  const date = [shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate()]
+    .map((value, index) => String(value).padStart(index === 0 ? 4 : 2, "0"))
+    .join(".");
+  const filename = `${date}.md`;
+  const matches = markdownPaths.filter(
+    (path) => path === filename || path.endsWith(`/${filename}`),
+  );
+  return matches.length === 1 ? { date, targetPath: matches[0] } : { date };
+}
+
 interface IndexAdapter {
   exists(path: string): Promise<boolean>;
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
@@ -988,6 +1033,37 @@ export class VaultIndex {
       }
       evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
       if (evidence.length === (applyCalibratedCutoff ? 6 : 4)) break;
+    }
+    if (stale) this.queueReplacement(active.model);
+    return evidence;
+  }
+
+  async retrievePaths(paths: Iterable<string>): Promise<RetrievedEvidence[]> {
+    const active = this.active;
+    const revision = this.revision;
+    if (!active) return [];
+
+    const entries = new Map(active.catalog.entries.map((entry) => [entry.path, entry]));
+    const sources = new Map(this.listSources().map((source) => [source.path, source]));
+    const evidence: RetrievedEvidence[] = [];
+    const queryId = ++this.querySequence;
+    let stale = false;
+    for (const path of new Set(paths)) {
+      const entry = entries.get(path);
+      if (entry?.status !== "indexed" || !entry.record) continue;
+      const record = active.records.get(entry.record);
+      const chunk = record?.chunks[0];
+      const source = sources.get(path);
+      const hydrated = chunk && source
+        ? await this.hydrate(entry, chunk, 1, source)
+        : null;
+      if (revision !== this.revision) return [];
+      if (!hydrated) {
+        stale = true;
+        continue;
+      }
+      evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
+      if (evidence.length === 4) break;
     }
     if (stale) this.queueReplacement(active.model);
     return evidence;

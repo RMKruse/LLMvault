@@ -97,3 +97,81 @@ test("delete all persists its gate before removal and leaves failures retryable"
   assert.equal(plugin.isDeletionIncomplete(), false);
   assert.equal(saves.at(-1).vaultChatDeletionPending, false);
 });
+
+test("Daily Recap uses one metadata-link layer and bypasses semantic retrieval", async () => {
+  const Plugin = await loadPlugin();
+  const plugin = new Plugin();
+  const files = [
+    { path: "Labortagebuch/2026.09.02.md" },
+    { path: "Notes/alpha.md" },
+    { path: "Notes/beta.md" },
+    { path: "Notes/second-hop.md" },
+  ];
+  const cacheReads = [];
+  const resolvedLinks = [];
+  plugin.app = {
+    metadataCache: {
+      getFileCache(file) {
+        cacheReads.push(file.path);
+        return file === files[0]
+          ? { links: [{ link: "alpha" }, { link: "alpha" }, { link: "beta" }] }
+          : { links: [{ link: "second-hop" }] };
+      },
+      getFirstLinkpathDest(link, sourcePath) {
+        resolvedLinks.push([link, sourcePath]);
+        return files.find((file) => file.path.endsWith(`/${link}.md`)) ?? null;
+      },
+    },
+    vault: { getMarkdownFiles: () => files },
+  };
+  let semanticQueries = 0;
+  let selectedPaths = [];
+  plugin.index = {
+    async retrieve() {
+      semanticQueries += 1;
+      return ["semantic"];
+    },
+    async retrievePaths(paths) {
+      selectedPaths = [...new Set(paths)];
+      return ["recap"];
+    },
+  };
+  const now = new Date("2026-09-03T10:00:00Z");
+
+  assert.deepEqual(
+    await plugin.retrieve(
+      "fasse mir zusammen was ich gestern gemacht habe",
+      now,
+      "Europe/Berlin",
+    ),
+    ["recap"],
+  );
+  assert.deepEqual(selectedPaths, [
+    "Labortagebuch/2026.09.02.md",
+    "Notes/alpha.md",
+    "Notes/beta.md",
+  ]);
+  assert.deepEqual(cacheReads, ["Labortagebuch/2026.09.02.md"]);
+  assert.deepEqual(resolvedLinks, [
+    ["alpha", "Labortagebuch/2026.09.02.md"],
+    ["alpha", "Labortagebuch/2026.09.02.md"],
+    ["beta", "Labortagebuch/2026.09.02.md"],
+  ]);
+  assert.equal(semanticQueries, 0);
+  assert.deepEqual(
+    await plugin.retrieve("summary of today", now, "Europe/Berlin"),
+    [],
+  );
+  files.push({ path: "Archive/2026.09.02.md" });
+  assert.deepEqual(
+    await plugin.retrieve("summary of yesterday", now, "Europe/Berlin"),
+    [],
+  );
+  assert.equal(semanticQueries, 0);
+
+  assert.deepEqual(
+    await plugin.retrieve("what happened yesterday?", now, "Europe/Berlin"),
+    ["semantic"],
+  );
+  assert.equal(semanticQueries, 1);
+});

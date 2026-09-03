@@ -8,6 +8,7 @@ import {
   type RetrievedEvidence,
   classifyVaultSource,
   isSupportedVaultExtension,
+  resolveDailyRecapRequest,
 } from "./indexing";
 import {
   type LLMvaultSettings,
@@ -504,6 +505,8 @@ class VaultChatView extends ItemView {
   private async askQuestion(): Promise<void> {
     const question = this.questionEl?.value.trim() ?? "";
     if (!question) return;
+    const requestedAt = new Date();
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
     const conversationId = this.plugin.getConversationState().selectedConversationId;
     this.displayGeneration += 1;
@@ -516,7 +519,7 @@ class VaultChatView extends ItemView {
     try {
       await this.plugin.validateChatModel();
       if (requestGeneration !== this.requestGeneration) return;
-      const retrieved = await this.plugin.retrieve(question);
+      const retrieved = await this.plugin.retrieve(question, requestedAt, timeZone);
       if (requestGeneration !== this.requestGeneration) return;
       const evidence = await this.plugin.revalidateEvidence(retrieved);
       if (requestGeneration !== this.requestGeneration) return;
@@ -1365,9 +1368,24 @@ export default class LLMvaultPlugin extends Plugin {
     this.queryOllama.abortAll();
   }
 
-  retrieve(question: string): Promise<RetrievedEvidence[]> {
-    if (this.stopped) return Promise.resolve([]);
-    return this.index?.retrieve(question) ?? Promise.resolve([]);
+  async retrieve(
+    question: string,
+    now = new Date(),
+    timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+  ): Promise<RetrievedEvidence[]> {
+    if (this.stopped || !this.index) return [];
+    const request = this.dailyRecapRequest(question, now, timeZone);
+    if (!request) return this.index.retrieve(question);
+    if (!request.targetPath) return [];
+
+    const dailyFile = this.app.vault.getMarkdownFiles()
+      .find(({ path }) => path === request.targetPath);
+    if (!dailyFile) return [];
+    const directPaths = (this.app.metadataCache.getFileCache(dailyFile)?.links ?? [])
+      .map(({ link }) => this.app.metadataCache
+        .getFirstLinkpathDest(link, dailyFile.path)?.path)
+      .filter((path): path is string => path !== undefined);
+    return this.index.retrievePaths([dailyFile.path, ...directPaths]);
   }
 
   async chat(
@@ -1574,6 +1592,15 @@ export default class LLMvaultPlugin extends Plugin {
           anchors,
         );
       });
+  }
+
+  private dailyRecapRequest(question: string, now: Date, timeZone: string) {
+    return resolveDailyRecapRequest(
+      question,
+      now,
+      timeZone,
+      this.app.vault.getMarkdownFiles().map(({ path }) => path),
+    );
   }
 
   private handleVaultMutation(file: TAbstractFile, oldPath?: string): void {
