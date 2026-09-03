@@ -322,7 +322,9 @@ test("chat streams only answer content from strict NDJSON and requires done", as
   assert.deepEqual(JSON.parse(request.init.body), {
     model: "chat",
     messages,
+    options: { num_predict: 256 },
     stream: true,
+    think: false,
   });
   assert.deepEqual(chunks, ["Grounded ", "answer [S1]"]);
   assert.deepEqual(result, {
@@ -343,6 +345,32 @@ test("chat streams only answer content from strict NDJSON and requires done", as
         ["invalid_response", "stream_interrupted"].includes(error.code),
     );
   }
+});
+
+test("chat can add Evaluated Configuration sampling to the bounded request", async () => {
+  let body;
+  const client = new OllamaClient(async (_input, init) => {
+    body = JSON.parse(init.body);
+    return ndjson('{"message":{"content":"answer"},"done":true}\n');
+  });
+  const messages = [{ role: "user", content: "Question" }];
+
+  await client.chat(
+    11434,
+    "chat",
+    messages,
+    () => undefined,
+    true,
+    { num_ctx: 4_096, num_predict: 1, seed: 0, temperature: 0 },
+  );
+
+  assert.deepEqual(body, {
+    model: "chat",
+    messages,
+    options: { num_predict: 256, seed: 0, temperature: 0 },
+    stream: true,
+    think: false,
+  });
 });
 
 test("chat rejects a declared response overrun before accepting model output", async () => {

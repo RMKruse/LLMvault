@@ -272,21 +272,27 @@ async function rendererSetup(config) {
     }
   };
   const chat = plugin.chatOllama.chat.bind(plugin.chatOllama);
-  plugin.chatOllama.chat = async (...args) => {
+  plugin.chatOllama.chat = async (port, model, messages, onContent, stream) => {
     state.chatDispatchedAt = performance.now();
-    const onContent = args[3];
-    args[3] = (content) => {
+    const acceptContent = (content) => {
       const before = view().answerEl?.textContent;
       onContent(content);
       if (view().answerEl?.textContent !== before) state.acceptedTextAt.push(performance.now());
     };
     try {
-      const result = await chat(...args);
+      const result = await chat(
+        port,
+        model,
+        messages,
+        acceptContent,
+        stream,
+        { seed: 0, temperature: 0 },
+      );
       return result;
     } catch (error) {
       if (!state.injectLateOutput) throw error;
       await new Promise((resolve) => setTimeout(resolve, 300));
-      args[3]("late-output-must-be-rejected");
+      acceptContent("late-output-must-be-rejected");
       state.lateOutputInjected = true;
       return { content: "late-completion-must-not-persist" };
     }

@@ -420,6 +420,7 @@ export class OllamaClient {
     messages: OllamaMessage[],
     onContent: (content: string) => void,
     stream = true,
+    evaluationOptions?: { seed: 0; temperature: 0 },
   ): Promise<OllamaChatResult> {
     const route = "/api/chat";
     ollamaOrigin(port);
@@ -455,7 +456,16 @@ export class OllamaClient {
       const response = await this.transport(
         port,
         route,
-        { model, messages, stream },
+        {
+          model,
+          messages,
+          options: {
+            num_predict: 256,
+            ...(evaluationOptions ? { seed: 0, temperature: 0 } : {}),
+          },
+          stream,
+          think: false,
+        },
         controller.signal,
       );
       if (!response.ok) {

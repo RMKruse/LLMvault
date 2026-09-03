@@ -208,7 +208,7 @@ async function runCase(item, index, repetition, candidate) {
     ? null
     : await client.chat(11434, candidate.chatModel.name, messages, (text) => {
         streamed += text;
-      });
+      }, true, { seed: 0, temperature: 0 });
   const response = result?.content ??
     "INSUFFICIENT_EVIDENCE: The available Vault Content is insufficient for this question.";
   const chatDispatched = result !== null;
