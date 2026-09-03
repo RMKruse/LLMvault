@@ -159,6 +159,11 @@ test("Daily Recap uses one metadata-link layer and bypasses semantic retrieval",
   ]);
   assert.equal(semanticQueries, 0);
   assert.deepEqual(
+    await plugin.retrieve("summary of today and yesterday", now, "Europe/Berlin"),
+    [],
+  );
+  assert.equal(semanticQueries, 0);
+  assert.deepEqual(
     await plugin.retrieve("summary of today", now, "Europe/Berlin"),
     [],
   );

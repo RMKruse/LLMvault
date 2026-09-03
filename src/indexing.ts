@@ -102,7 +102,7 @@ export interface RetrievedEvidence {
 }
 
 export interface DailyRecapRequest {
-  date: string;
+  date?: string;
   targetPath?: string;
 }
 
@@ -120,8 +120,10 @@ export function resolveDailyRecapRequest(
   timeZone: string,
   markdownPaths: string[],
 ): DailyRecapRequest | null {
-  const relativeDay = RELATIVE_DAYS.find(([pattern]) => pattern.test(question));
+  const relativeDays = RELATIVE_DAYS.filter(([pattern]) => pattern.test(question));
+  const relativeDay = relativeDays[0];
   if (!relativeDay || !DAILY_RECAP_INTENT.test(question)) return null;
+  if (relativeDays.length !== 1) return {};
 
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
