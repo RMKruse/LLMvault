@@ -468,7 +468,7 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
     ],
   );
   assert.deepEqual(
-    (await index.retrieve("Which source is strongest?", false)).map(({ path }) => path),
+    (await index.retrieve("Which source is strongest?", false, 4)).map(({ path }) => path),
     ["seven.md", "six.md", "five.md", "four.md"],
   );
   assert.ok(models.every((requestedModel) => requestedModel === model));

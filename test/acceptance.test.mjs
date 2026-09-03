@@ -99,3 +99,62 @@ test("a missing production recording fails closed", () => {
   assert.doesNotThrow(() => evaluateAcceptance({ runs: [{}] }));
   assert.equal(evaluateAcceptance({ runs: [] }).pass, false);
 });
+
+test("prototype release requires all proof layers and hash-bound human support", async () => {
+  const { evaluateGroundedProof, supportBinding } = await import("../evaluation/proof.mjs");
+  assert.equal(evaluateGroundedProof({}).pass, false);
+  const config = { pluginBuildSha256: "a".repeat(64) };
+  const item = { id: "direct", responseSha256: "b".repeat(64), request: { messageSha256: ["c".repeat(64)] },
+    citedLocatorSha256: ["d".repeat(64)], retrieval: [{ identity: "e".repeat(64) }] };
+  const binding = supportBinding(config, item);
+  for (const mutate of [
+    (c, i) => { i.responseSha256 = "f".repeat(64); },
+    (c, i) => { i.request.messageSha256[0] = "f".repeat(64); },
+    (c, i) => { i.citedLocatorSha256[0] = "f".repeat(64); },
+    (c) => { c.pluginBuildSha256 = "f".repeat(64); },
+  ]) {
+    const c = structuredClone(config), i = structuredClone(item); mutate(c, i);
+    assert.notEqual(supportBinding(c, i), binding);
+  }
+});
+
+test("a complete Grounded Answer proof fails closed on missing, changed or unapproved evidence", async () => {
+  const { evaluateGroundedProof, supportBinding, PINNED_CHAT, PINNED_EMBEDDING, PINNED_INDEX_SIGNATURE, PROMPT_SHA256 } = await import("../evaluation/proof.mjs");
+  const configuration = {
+    pluginBuildSha256: "a".repeat(64), pluginCommit: "b".repeat(40), chatModel: PINNED_CHAT,
+    embeddingModel: PINNED_EMBEDDING,
+    indexSignature: PINNED_INDEX_SIGNATURE,
+    promptSha256: PROMPT_SHA256, cutoff: 0.5710371502360156, ollamaVersion: "0.33.2",
+  };
+  const cases = ["daily", "direct", "direct-history"].flatMap((id) =>
+    Array.from({ length: id === "direct-history" ? 1 : 3 }, (_, i) => {
+      const messageSha256 = [PROMPT_SHA256, ...(id === "direct-history" ? ["e".repeat(64), "f".repeat(64)] : []), "d".repeat(64)];
+      return {
+        id, repetition: i + 1, responseSha256: "a".repeat(64), expectedMessageSha256: messageSha256,
+        request: { origin: "http://127.0.0.1:11434", path: "/api/chat", method: "POST", model: PINNED_CHAT.name,
+          stream: true, think: false, keys: ["messages", "model", "options", "stream", "think"],
+          optionKeys: ["num_predict", "seed", "temperature"], options: { num_predict: 256, seed: 0, temperature: 0 },
+          roles: ["system", ...(id === "direct-history" ? ["user", "assistant"] : []), "user"], messageSha256 },
+        diagnostics: { eval_count: 42, prompt_eval_count: 100, total_duration: 1, done_reason: "stop" },
+        contextLength: 4096, effectiveModelDigest: PINNED_CHAT.digest, durationMs: 20,
+        answerPass: true, pathPass: true, registryPass: true, locatorPass: true, modelDigestsPass: true, streamedExactly: true,
+        retrieval: [{ identity: "b".repeat(64), rank: 1 }], citedLocatorSha256: ["b".repeat(64)],
+      };
+    }));
+  const proof = { configuration, cases, sourceBeforeSha256: "f".repeat(64), sourceAfterSha256: "f".repeat(64),
+    requestCount: 7, egressPass: true, approvedBindings: cases.map((item) => supportBinding(configuration, item)) };
+  assert.equal(evaluateGroundedProof(proof).pass, true);
+  for (const [gate, change] of [
+    ["humanSupport", (p) => { p.approvedBindings = []; }],
+    ["repeatability", (p) => { p.cases[1].responseSha256 = "c".repeat(64); }],
+    ["requests", (p) => { delete p.cases[0].request; }],
+    ["effectiveContext", (p) => { p.cases[0].contextLength = 8192; }],
+    ["evidence", (p) => { p.cases[0].citedLocatorSha256 = []; }],
+    ["sourceUnchanged", (p) => { delete p.sourceAfterSha256; }],
+    ["egress", (p) => { p.egressPass = false; }],
+  ]) {
+    const changed = structuredClone(proof); change(changed);
+    assert.equal(evaluateGroundedProof(changed).gates[gate], false, gate);
+    assert.equal(evaluateGroundedProof(changed).pass, false, gate);
+  }
+});

@@ -136,3 +136,57 @@ test("synthetic quality-suite fixture is complete and checksummed", async () => 
     assert.equal(text.slice(item.start, item.end), item.quote, `${item.path}:${item.start}`);
   }
 });
+
+
+test("calibration sees rank six and uncapped candidates without changing product cutoff", async () => {
+  const scores = [0.91, 0.85, 0.79, 0.73, 0.67, 0.61, 0.55];
+  const sources = scores.map((score, i) => ({ path: `${i}.md`, read: async () => String(i) }));
+  const embed = async (inputs) => inputs.map((input) => [
+    input === "question" ? 1 : scores[Number(input)],
+    ...Array(REFERENCE_CONFIGURATION.indexSignature.vectorDimension - 1).fill(0),
+  ]);
+  const index = new VaultIndex(new MemoryAdapter(), "index", () => sources, embed);
+  await index.start(REFERENCE_CONFIGURATION.embeddingModel);
+  const product = await index.retrieve("question");
+  assert.deepEqual(product.map(({ path }) => path), ["0.md", "1.md", "2.md", "3.md", "4.md", "5.md"]);
+  assert.equal((await index.retrieve("question", true, 4)).length, 4);
+  const uncapped = await index.retrieve("question", false, Infinity);
+  assert.equal(uncapped.length, 7);
+  const cutoff = calibrateCutoff(REFERENCE_CONFIGURATION.embeddingModel.digest, [{
+    gold: ["5.md"],
+    ranked: uncapped.map(({ path, score }) => ({ evidence: [path], score })),
+  }]);
+  assert.ok(Math.abs(cutoff.minimumScore - 0.61) < 1e-6);
+});
+
+test("proof gates inspect serialized controls, messages and terminal diagnostics", async () => {
+  const { observeRequest, requestPass } = await import("../evaluation/proof.mjs");
+  const messages = [{ role: "system", content: GROUNDING_SYSTEM_PROMPT }, { role: "user", content: "private question" }];
+  const request = { origin: "http://127.0.0.1:11434", path: "/api/chat", method: "POST", body: {
+    model: "chat", messages, stream: true, think: false, options: { num_predict: 256, seed: 0, temperature: 0 },
+  } };
+  const expected = { model: "chat", messageSha256: messages.map(({ content }) => createHash("sha256").update(content).digest("hex")) };
+  const diagnostics = { eval_count: 42, prompt_eval_count: 100, done_reason: "stop", total_duration: 1 };
+  assert.equal(requestPass(observeRequest(request), diagnostics, expected), true);
+  assert.doesNotMatch(JSON.stringify(observeRequest(request)), /private question/);
+  for (const change of [
+    (r) => { r.body.think = true; },
+    (r) => { r.body.options.num_ctx = 4096; },
+    (r) => { delete r.body.options.seed; },
+    (r) => { r.body.messages[1].content = "wrong current question"; },
+    (r) => { r.body.model = "other"; },
+    (r) => { r.origin = "https://elsewhere.invalid"; },
+  ]) {
+    const changed = structuredClone(request); change(changed);
+    assert.equal(requestPass(observeRequest(changed), diagnostics, expected), false);
+  }
+  assert.equal(requestPass(observeRequest(request), { ...diagnostics, eval_count: 257 }, expected), false);
+  assert.equal(requestPass(observeRequest(request), {}, expected), false);
+  assert.equal(requestPass(undefined, diagnostics, expected), false);
+  const missingHashes = observeRequest(request);
+  delete missingHashes.messageSha256;
+  assert.equal(requestPass(missingHashes, diagnostics, { model: "chat" }), false);
+  const wrongRole = observeRequest(request);
+  wrongRole.roles[0] = "user";
+  assert.equal(requestPass(wrongRole, diagnostics, expected), false);
+});

@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+
+import { evaluateRelease, supportBinding } from "./proof.mjs";
 
 const MIB = 1024 * 1024;
 const RECOVERY_BOUNDARIES = ["record", "catalog", "pointer", "cleanup"];
@@ -67,7 +69,17 @@ export function evaluateAcceptance(report) {
 
 async function check(reportPath) {
   const report = JSON.parse(await readFile(reportPath, "utf8"));
-  const result = evaluateAcceptance(report);
+  const approval = process.argv.find((arg) => arg.startsWith("--approve="))?.slice(10);
+  if (approval) {
+    const proof = report.groundedAnswer;
+    if (!proof?.cases.some((item) => supportBinding(proof.configuration, item) === approval)) {
+      throw new Error("approval must match a current local review binding");
+    }
+    proof.approvedBindings = [...new Set([...(proof.approvedBindings ?? []), approval])];
+  }
+  const acceptance = evaluateAcceptance(report);
+  const result = evaluateRelease(report, acceptance);
+  if (approval) await writeFile(reportPath, `${JSON.stringify({ ...report, acceptance, ...result }, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (!result.pass) process.exitCode = 1;
 }

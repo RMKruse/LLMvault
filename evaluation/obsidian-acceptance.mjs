@@ -1,7 +1,7 @@
 /* global localStorage */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,10 @@ import { performance } from "node:perf_hooks";
 import process from "node:process";
 import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
 import { setTimeout as delay } from "node:timers/promises";
+
+import { REFERENCE_CONFIGURATION } from "../src/retrieval-calibration.ts";
+import { PINNED_CHAT, PROMPT_SHA256, hash, evaluateRelease } from "./proof.mjs";
+import { QUESTIONS, groundedCase, summarizeGrounded } from "./grounded-acceptance.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const PLUGIN_ID = "llmvault";
@@ -248,10 +252,21 @@ async function rendererSetup(config) {
     lateOutputInjected: false,
     lastInvalidatedAt: 0,
     recoveryExposedInvalidContent: false,
+    requestCount: 0,
+    egressPass: true,
     ui: {},
     uiPhase: null,
     uiTimer: null,
   };
+  for (const client of [plugin.ollama, plugin.chatOllama, plugin.queryOllama, plugin.indexOllama]) {
+    const fetcher = client.fetcher;
+    client.fetcher = async (input, init) => {
+      const url = new URL(input);
+      state.requestCount += 1;
+      state.egressPass &&= url.origin === "http://127.0.0.1:11434";
+      return await fetcher(input, init);
+    };
+  }
   const indexEmbed = plugin.indexOllama.embed.bind(plugin.indexOllama);
   plugin.indexOllama.embed = async (...args) => {
     const started = performance.now();
@@ -368,6 +383,7 @@ async function rendererSetup(config) {
   }
 
   globalThis.__llmvaultAcceptance = {
+    network() { return { requestCount: state.requestCount, egressPass: state.egressPass }; },
     async cold() {
       plugin.indexOllama.abortAll();
       plugin.index.cancel();
@@ -713,6 +729,20 @@ async function obsidianVersion(executable) {
   return output.trim();
 }
 
+async function sourceManifest(source) {
+  const files = (await filesUnder(source, "", true, true)).sort((a, b) => a.path.localeCompare(b.path));
+  const digest = createHash("sha256");
+  for (const file of files) {
+    digest.update(JSON.stringify([file.path, hash(await readFile(path.join(source, file.path)))]));
+  }
+  return digest.digest("hex");
+}
+
+async function readJson(file) {
+  try { return JSON.parse(await readFile(file, "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}
+
 export async function runHarness(evaluateAcceptance) {
   const source = path.resolve(option("vault") ?? "");
   const executable = path.resolve(option("obsidian") ?? "");
@@ -721,6 +751,10 @@ export async function runHarness(evaluateAcceptance) {
   if (!option("vault") || !option("obsidian") || !chatModel || !embeddingModel) {
     throw new Error("usage: npm run acceptance:run -- --vault=/path --obsidian=/path/to/Obsidian --chat=MODEL --embedding=MODEL [--output=FILE] [--keep-temp]");
   }
+  if (chatModel !== PINNED_CHAT.name || embeddingModel !== REFERENCE_CONFIGURATION.embeddingModel.name) {
+    throw new Error("prototype acceptance requires the pinned configuration");
+  }
+  const sourceBeforeSha256 = await sourceManifest(source);
   const sourceFiles = await filesUnder(source);
   const physicalVaultBytes = (await filesUnder(source, "", true, true))
     .reduce((sum, file) => sum + file.bytes, 0);
@@ -744,6 +778,11 @@ export async function runHarness(evaluateAcceptance) {
     const embeddingDigest = discovery.modelDigests[embeddingModel];
     if (!chatDigest || !discovery.chatModels.includes(chatModel)) throw new Error(`unavailable chat model: ${chatModel}`);
     if (!embeddingDigest || !discovery.embeddingModels.includes(embeddingModel)) throw new Error(`unavailable embedding model: ${embeddingModel}`);
+    if (chatDigest !== PINNED_CHAT.digest || embeddingDigest !== REFERENCE_CONFIGURATION.embeddingModel.digest) {
+      throw new Error("prototype model digest mismatch");
+    }
+    const output = path.resolve(option("output") ?? path.join(ROOT, "evaluation/results/prototype-acceptance.json"));
+    const previous = await readJson(output);
     const report = {
       environment: {
         hardware: { architecture: process.arch, cpu: os.cpus()[0]?.model, memoryBytes: os.totalmem() },
@@ -752,7 +791,28 @@ export async function runHarness(evaluateAcceptance) {
         vault: { bytes: physicalVaultBytes, contentFiles: contentFiles.length, totalFiles: sourceFiles.length },
         versions: { node: process.version, obsidian: await obsidianVersion(executable), ollama: discovery.version, plugin: manifest.version },
       },
+      groundedAnswer: {
+        sourceBeforeSha256, cases: [], approvedBindings: previous?.groundedAnswer?.approvedBindings ?? [], requestCount: 0, egressPass: true,
+      },
       runs: [],
+    };
+    const reviews = [];
+    const captureNetwork = async () => {
+      const observed = await instance.cdp.evaluate("__llmvaultAcceptance.network()");
+      report.groundedAnswer.requestCount += observed.requestCount;
+      report.groundedAnswer.egressPass &&= observed.egressPass;
+    };
+    const save = async () => {
+      report.groundedAnswer.sourceAfterSha256 = await sourceManifest(source);
+      report.tests = await readJson(path.join(ROOT, "evaluation/results/prototype-tests.json"));
+      report.quality = await readJson(path.resolve(option("quality") ?? path.join(ROOT, "evaluation/results/prototype-quality.json")));
+      report.acceptance = evaluateAcceptance(report);
+      Object.assign(report, evaluateRelease(report, report.acceptance));
+      await mkdir(path.dirname(output), { recursive: true });
+      await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
+      // Unredacted review material is local-only, ignored by Git and never embedded in the report.
+      await writeFile(path.join(ROOT, "evaluation/results/local-review.json"), `${JSON.stringify(reviews, null, 2)}\n`, { mode: 0o600 });
+      await chmod(path.join(ROOT, "evaluation/results/local-review.json"), 0o600);
     };
     const repetitions = 1;
     let currentToken = "initial-acceptance-token";
@@ -760,6 +820,31 @@ export async function runHarness(evaluateAcceptance) {
       await instance.cdp.evaluate(`__llmvaultAcceptance.ensureProbe(${JSON.stringify(currentToken)})`);
       const cold = await instance.cdp.evaluate("__llmvaultAcceptance.cold()");
       const warm = await instance.cdp.evaluate("__llmvaultAcceptance.warm()");
+      report.groundedAnswer.configuration = {
+        pluginBuildSha256: hash(await readFile(path.join(workspace.vault, ".obsidian/plugins/llmvault/main.js"))),
+        pluginCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim(),
+        chatModel: { name: chatModel, digest: chatDigest },
+        embeddingModel: { name: embeddingModel, digest: embeddingDigest },
+        indexSignature: await instance.cdp.evaluate("app.plugins.plugins.llmvault.index.getSignature()"),
+        cutoff: REFERENCE_CONFIGURATION.minimumScore,
+        promptSha256: PROMPT_SHA256, ollamaVersion: discovery.version,
+      };
+      await save();
+      for (const id of ["daily", "direct", "direct-history"]) {
+        for (let run = 1; run <= (id === "direct-history" ? 1 : 3); run += 1) {
+          await captureNetwork();
+          // Fresh plugin instances give fresh query-scoped citation IDs without editing production state.
+          await instance.cdp.evaluate("app.plugins.unloadPlugin('llmvault')");
+          await setupInstance(instance, config);
+          await instance.cdp.evaluate("__llmvaultAcceptance.waitUntilReady()");
+          const raw = await instance.cdp.evaluateFunction(groundedCase, QUESTIONS[id === "daily" ? "daily" : "direct"], id === "direct-history");
+          const { item, review } = summarizeGrounded(raw, report.groundedAnswer.configuration, id, run);
+          report.groundedAnswer.cases.push(item);
+          reviews.push(review);
+          await save();
+          process.stderr.write(`grounded acceptance ${id} ${run}: answer=${item.answerPass} path=${item.pathPass} registry=${item.registryPass}\n`);
+        }
+      }
       const rebuilt = await peakDuring(instance.cdp.evaluate("__llmvaultAcceptance.rebuild()"), indexRoot);
       const nextToken = `acceptance-run-${repetition}-${randomUUID()}`;
       const mutation = await instance.cdp.evaluate(`__llmvaultAcceptance.mutation(${JSON.stringify(currentToken)},${JSON.stringify(nextToken)})`);
@@ -798,6 +883,7 @@ export async function runHarness(evaluateAcceptance) {
             token: currentToken,
           };
         }
+        await captureNetwork();
         const recovered = await crashRecovery(instance, executable, workspace, config, boundary, operation, expected);
         instance = recovered.instance;
         recovery.push(recovered.result);
@@ -823,16 +909,11 @@ export async function runHarness(evaluateAcceptance) {
         warm,
       };
       report.runs.push(run);
-      const interim = evaluateAcceptance(report);
-      const output = path.resolve(option("output") ?? path.join(ROOT, "evaluation/results/acceptance.json"));
-      await mkdir(path.dirname(output), { recursive: true });
-      await writeFile(output, `${JSON.stringify({ ...report, ...interim }, null, 2)}\n`);
+      await captureNetwork();
+      await save();
       process.stderr.write(`acceptance repetition ${repetition}/${repetitions} complete\n`);
     }
-    Object.assign(report, evaluateAcceptance(report));
-    const output = path.resolve(option("output") ?? path.join(ROOT, "evaluation/results/acceptance.json"));
-    await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
-    process.stdout.write(`${JSON.stringify({ gates: report.gates, output, pass: report.pass }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ gates: report.gates, groundedGates: report.groundedGates, output, pass: report.pass }, null, 2)}\n`);
     if (!report.pass) process.exitCode = 1;
   } finally {
     await stopObsidian(instance);

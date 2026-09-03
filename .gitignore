@@ -8,3 +8,5 @@ release-candidate/
 *.map
 evaluation/results/in-progress.json
 .DS_Store
+evaluation/results/prototype-*.json
+evaluation/results/local-review.json

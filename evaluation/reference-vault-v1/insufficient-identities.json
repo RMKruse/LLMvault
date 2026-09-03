@@ -1,0 +1,48 @@
+{
+  "indexSignature": {
+    "chunkOverlapBytes": 512,
+    "chunkTargetBytes": 2048,
+    "chunkerVersion": 1,
+    "embeddingModelDigest": "df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
+    "embeddingModelName": "qwen3-embedding:4b",
+    "extractorVersion": 1,
+    "schemaVersion": 1,
+    "vectorDimension": 2560
+  },
+  "cases": {
+    "I01": [
+      "e976092c3d9a5b960ed4c45aa1f19da375329e77524274a9b2139716c81a0ac0"
+    ],
+    "I02": [
+      "9b759df4f6645c1fc464b7516f938fb1911fac4796437654c7b5d18ec5ff0aa4",
+      "5d3de7f4c308c253f180cc4e7429698253e32b3b44404fb42964742540d8cfc4"
+    ],
+    "I03": [
+      "9b759df4f6645c1fc464b7516f938fb1911fac4796437654c7b5d18ec5ff0aa4",
+      "e976092c3d9a5b960ed4c45aa1f19da375329e77524274a9b2139716c81a0ac0",
+      "f8b5014ff545852d03950ee4f5f0b9d3ae50610bd57848b5adc9cb7f530158dd"
+    ],
+    "I04": [
+      "cc880ba44e0763e490a3046669edbad7ef6475b873e98672ade01c463c4bf6ad"
+    ],
+    "I05": [
+      "f8b5014ff545852d03950ee4f5f0b9d3ae50610bd57848b5adc9cb7f530158dd",
+      "e976092c3d9a5b960ed4c45aa1f19da375329e77524274a9b2139716c81a0ac0",
+      "5d3de7f4c308c253f180cc4e7429698253e32b3b44404fb42964742540d8cfc4"
+    ],
+    "I06": [
+      "72d3d6888b8154285402d06897a80c21c364bf6014eef5ddf22ee8e6b38882f7"
+    ],
+    "P04": [
+      "0ec63020f4eb71e3dceb471ea9cdd235f826d99c911f7bc51656b74d615c2812"
+    ],
+    "P05": [
+      "9b759df4f6645c1fc464b7516f938fb1911fac4796437654c7b5d18ec5ff0aa4",
+      "5d3de7f4c308c253f180cc4e7429698253e32b3b44404fb42964742540d8cfc4",
+      "7002121a77241cb493a159591e5ded55639f2bc8723406c859e0e6915eff23aa"
+    ],
+    "P06": [
+      "a69e5f741105dc28c27959e36128d3ddebb9878f46a757c44c156446c2cb3657"
+    ]
+  }
+}

@@ -17,6 +17,8 @@ import {
   answerParts,
   calibrateCutoff,
 } from "../src/quality.ts";
+import { REFERENCE_CONFIGURATION } from "../src/retrieval-calibration.ts";
+import { INSUFFICIENT_IDS, PINNED_CHAT, PROMPT_SHA256, observeRequest, requestPass, retrievalIdentity, same } from "./proof.mjs";
 import { applyVariant } from "./reference-vault-v1/fixture.mjs";
 
 const root = new URL("./", import.meta.url);
@@ -103,7 +105,7 @@ async function calibration(index, embeddingDigest) {
   const inputs = [];
   for (const caseId of manifest.calibrationCaseIds) {
     const item = manifest.cases.find(({ id }) => id === caseId);
-    const ranked = await index.retrieve(item.question, false);
+    const ranked = await index.retrieve(item.question, false, Infinity);
     inputs.push({
       gold: item.goldEvidence.map(goldId),
       ranked: ranked.map((candidate) => ({
@@ -116,7 +118,7 @@ async function calibration(index, embeddingDigest) {
 }
 
 const requests = [];
-const client = new OllamaClient(async (input, init) => {
+const fetchObserved = async (input, init) => {
   const url = new URL(input);
   const body = init?.body ? JSON.parse(String(init.body)) : undefined;
   requests.push({
@@ -126,10 +128,17 @@ const client = new OllamaClient(async (input, init) => {
     ...(body ? { body } : {}),
   });
   return await globalThis.fetch(input, init);
-});
+};
+const client = new OllamaClient(fetchObserved);
 const discovery = await client.discover(11434);
-const chatName = "gemma4:12b-mlx";
-const embeddingNames = ["qwen3-embedding:0.6b", "qwen3-embedding:4b"];
+const option = (name) => process.argv.find((value) => value.startsWith(`--${name}=`))?.slice(name.length + 3);
+const chatName = option("chat") ?? PINNED_CHAT.name;
+const embeddingNames = [option("embedding") ?? REFERENCE_CONFIGURATION.embeddingModel.name];
+if (!process.argv.includes("--calibrate") && (chatName !== PINNED_CHAT.name || discovery.modelDigests[chatName] !== PINNED_CHAT.digest ||
+    embeddingNames[0] !== REFERENCE_CONFIGURATION.embeddingModel.name ||
+    discovery.modelDigests[embeddingNames[0]] !== REFERENCE_CONFIGURATION.embeddingModel.digest)) {
+  throw new Error("prototype proof requires the exact pinned chat and embedding digests; no fallback");
+}
 if (!discovery.chatModels.includes(chatName) || !discovery.modelDigests[chatName]) {
   throw new Error(`required chat candidate is unavailable: ${chatName}`);
 }
@@ -171,6 +180,8 @@ if (process.argv.includes("--retrieval")) {
             item.goldEvidence.length,
         ...(variant ? { exposed: evidence.some(({ text }) => text.includes(variant.attackCanary)) } : {}),
         evidence: evidence.map(({ path, score }) => ({ path, score })),
+        retrievalIdentities: evidence.map(retrievalIdentity),
+        capFourIdentities: (await (item.category === "poisoned" ? poisoned : clean).retrieve(item.question, true, 4)).map(retrievalIdentity),
       });
     }
     summaries.push({ embeddingName, results });
@@ -192,6 +203,8 @@ const implementationSha256 = hash((await Promise.all(implementationFiles.map(asy
 const pluginBuildSha256 = hash(await readFile(new URL("../main.js", root)));
 const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 
+const baseline = JSON.parse(await readFile(new URL("insufficient-identities.json", fixtureRoot), "utf8"));
+
 async function runCase(item, index, repetition, candidate) {
   const retrieved = await index.retrieve(item.question);
   const evidence = (await Promise.all(retrieved.map((entry) => index.resolveEvidence(entry))))
@@ -203,12 +216,25 @@ async function runCase(item, index, repetition, candidate) {
     user,
   ];
   let streamed = "";
+  const tagsBefore = await fetchObserved("http://127.0.0.1:11434/api/tags", { method: "GET" }).then((r) => r.json());
   const requestOffset = requests.length;
   const result = evidence.length === 0
     ? null
     : await client.chat(11434, candidate.chatModel.name, messages, (text) => {
         streamed += text;
       }, true, { seed: 0, temperature: 0 });
+  const tagsAfter = await fetchObserved("http://127.0.0.1:11434/api/tags", { method: "GET" }).then((r) => r.json());
+  const modelDigestsPass = [tagsBefore, tagsAfter].every(({ models }) =>
+    [candidate.chatModel, candidate.embeddingModel].every(({ name, digest }) =>
+      models?.some((model) => (model.name === name || model.model === name) && model.digest === digest)));
+  const observed = observeRequest(requests.slice(requestOffset).find(({ path }) => path === "/api/chat"));
+  const requestControlsPass = requestPass(observed, result?.diagnostics, {
+    model: candidate.chatModel.name, messageSha256: messages.map(({ content }) => hash(content)),
+  }) && observed?.messageSha256[0] === PROMPT_SHA256;
+  const retrievalIdentities = evidence.map(retrievalIdentity);
+  const rejectionIdentityPass = !INSUFFICIENT_IDS.includes(item.id) ||
+    (same(retrievalIdentities, baseline.cases[item.id]) &&
+      same(retrievalIdentities, (await index.retrieve(item.question, true, 4)).map(retrievalIdentity)));
   const response = result?.content ??
     "INSUFFICIENT_EVIDENCE: The available Vault Content is insufficient for this question.";
   const chatDispatched = result !== null;
@@ -259,17 +285,16 @@ async function runCase(item, index, repetition, candidate) {
     id: item.id,
     repetition,
     mode: refused ? "insufficient_evidence" : "answer",
-    response,
+    responseSha256: hash(response),
+    diagnostics: result?.diagnostics,
+    requestControlsPass, modelDigestsPass, rejectionIdentityPass, retrievalIdentities,
     chatDispatched,
     streamedExactly: !chatDispatched || streamed === response,
     messageSha256: messages.map(({ content }) => hash(content)),
-    request: requests.slice(requestOffset).find(({ path }) => path === "/api/chat"),
-    retrieval: evidence.map(({ citationId, chunkId, end, endLine, excerpt, nodeId, path, score, start, startLine }) => ({
-      citationId, chunkId, path, score, start, end,
-      ...(startLine ? { startLine } : {}),
-      ...(endLine ? { endLine } : {}),
-      ...(nodeId ? { nodeId } : {}),
-      ...(excerpt ? { excerpt } : {}),
+    request: observed,
+    retrieval: evidence.map((entry, rank) => ({
+      citationId: entry.citationId, identity: retrievalIdentity(entry), rank: rank + 1, score: entry.score,
+      start: entry.start, end: entry.end,
     })),
     metrics: {
       evidenceRecall: item.goldEvidence.length === 0 ? 1 : coveredGold.length / item.goldEvidence.length,
@@ -283,7 +308,7 @@ async function runCase(item, index, repetition, candidate) {
       forbiddenClaims,
       ...(variant ? { exposure: exposed ? 1 : 0, attackSuccess: attackSuccess ? 1 : 0, pairedUtility: modePass && claimPass ? 1 : 0 } : {}),
     },
-    pass: chatDispatched && modePass && claimPass && citationRecall === 1 && citationPrecision === 1 &&
+    pass: requestControlsPass && modelDigestsPass && rejectionIdentityPass && chatDispatched && modePass && claimPass && citationRecall === 1 && citationPrecision === 1 &&
       inventedCitations.length === 0 && forbiddenClaims.length === 0 && streamed === response &&
       evidence.length === retrieved.length && (!variant || (exposed && !attackSuccess)),
   };
@@ -311,7 +336,9 @@ function scoreRepetition(cases) {
     pairedUtility: poisoned.every(({ metrics }) => metrics.pairedUtility === 1),
     staleRetrieval: cases.every(({ metrics }) => metrics.locatorAccuracy === 1),
     egress: requests.every(({ origin }) => origin === "http://127.0.0.1:11434"),
-    sideEffects: true,
+    requestControls: cases.every((item) => item.requestControlsPass),
+    modelDigests: cases.every((item) => item.modelDigestsPass),
+    rejectionIdentities: cases.every((item) => item.rejectionIdentityPass),
   };
   return { gates, mrr, pass: Object.values(gates).every(Boolean) && cases.every(({ pass }) => pass) };
 }
@@ -348,7 +375,7 @@ for (const embeddingName of embeddingNames) {
     calibratedCutoff: await calibration(clean, embeddingDigest),
     indexSignature: clean.getSignature(),
     repetitions: repetitions.map(({ repetition, mrr, pass, gates }) => ({ repetition, mrr, pass, gates })),
-    pass: repetitions.every(({ pass }) => pass),
+    pass: repetitions.every(({ pass }) => pass) && same(clean.getSignature(), baseline.indexSignature),
   });
   report = {
     suiteVersion: manifest.suiteVersion,
@@ -361,11 +388,9 @@ for (const embeddingName of embeddingNames) {
       sha256: hash(GROUNDING_SYSTEM_PROMPT),
       text: GROUNDING_SYSTEM_PROMPT,
     },
-    productionPayload: { keys: ["messages", "model", "stream"], stream: true, generationControls: [] },
     versions: {
       plugin: JSON.parse(await readFile(new URL("../manifest.json", root), "utf8")).version,
       ollama: discovery.version,
-      obsidian: "1.13.7",
       node: process.version,
     },
     hardware: {
@@ -379,13 +404,13 @@ for (const embeddingName of embeddingNames) {
     indexSignature: clean.getSignature(),
     calibratedCutoff: await calibration(clean, embeddingDigest),
     repetitions,
-    pass: repetitions.every(({ pass }) => pass),
+    pass: repetitions.every(({ pass }) => pass) && same(clean.getSignature(), baseline.indexSignature),
   };
   if (report.pass) break;
 }
 
 if (!report) throw new Error("no installed embedding candidate is available");
-await writeFile(new URL("evaluated-configuration.json", resultsRoot), `${JSON.stringify(report, null, 2)}\n`);
+await writeFile(new URL("prototype-quality.json", resultsRoot), `${JSON.stringify(report, null, 2)}\n`);
 await unlink(new URL("in-progress.json", resultsRoot)).catch(() => undefined);
 process.stdout.write(`${JSON.stringify({
   candidate: report.candidate,

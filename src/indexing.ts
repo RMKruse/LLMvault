@@ -965,6 +965,7 @@ export class VaultIndex {
   async retrieve(
     question: string,
     applyCalibratedCutoff = true,
+    candidateLimit = 6,
   ): Promise<RetrievedEvidence[]> {
     const active = this.active;
     const revision = this.revision;
@@ -1034,7 +1035,7 @@ export class VaultIndex {
         continue;
       }
       evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
-      if (evidence.length === (applyCalibratedCutoff ? 6 : 4)) break;
+      if (evidence.length >= candidateLimit) break;
     }
     if (stale) this.queueReplacement(active.model);
     return evidence;
