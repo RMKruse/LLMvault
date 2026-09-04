@@ -249,6 +249,59 @@ test("oversized Markdown lines split at Unicode code-point boundaries", () => {
   );
 });
 
+test("Markdown location work stays linear across many paragraphs and anchors", (t) => {
+  const paragraph = `${"x".repeat(62)}\n\n`;
+  const source = paragraph.repeat(8_192);
+  let deadlineChecks = 0, anchorReads = 0;
+  t.mock.method(performance, "now", () => { deadlineChecks += 1; return 0; });
+  const anchors = Array.from({ length: 8_192 }, (_, i) => ({
+    get offset() { anchorReads += 1; return i * paragraph.length; },
+    type: "block", value: String(i),
+  })).reverse();
+  const chunks = chunkMarkdown(source, anchors);
+  // Count traversal work instead of relying on machine-dependent timing.
+  assert.ok(deadlineChecks < source.length / 16, `${deadlineChecks} deadline checks`);
+  assert.ok(anchorReads < anchors.length * 40, `${anchorReads} anchor reads`);
+  for (const chunk of chunks) {
+    assert.equal(chunk.startLine, chunk.start / paragraph.length * 2 + 1);
+    assert.equal(chunk.endLine, chunk.end / paragraph.length * 2);
+    assert.equal(chunk.anchor.value, String(chunk.start / paragraph.length));
+  }
+});
+
+test("Markdown piece locations preserve lines and anchor precedence through splitting and overlap", () => {
+  const sources = [
+    "\n", "\r\n", "last line", "\n\nlast line\n",
+    `intro\n${"🙂".repeat(1_100)}\n${"packed line\n".repeat(500)}tail`,
+    `intro\r\n${"🙂".repeat(1_100)}\r\n${"packed line\r\n".repeat(500)}tail\r\n`,
+    `# First\n${"x".repeat(1_600)}\n\n${"y".repeat(400)}\n\n${"z".repeat(400)}\n# Last\ntail`,
+    `one\rtwo\u2028three\u2029four\n${"z".repeat(CHUNK_TARGET_BYTES)}\n`,
+  ];
+  for (const source of sources) {
+    const anchors = [
+      { offset: 100, type: "block", value: "first inside chunk" },
+      { offset: CHUNK_TARGET_BYTES, type: "block", value: "at boundary" },
+      { offset: CHUNK_TARGET_BYTES, type: "block", value: "last at boundary" },
+      { offset: source.indexOf("# Last"), type: "heading", value: "Last" },
+      { offset: source.length, type: "block", value: "outside source" },
+    ].reverse();
+    const valid = anchors.filter(({ offset }) => offset >= 0 && offset < source.length)
+      .sort((a, b) => a.offset - b.offset);
+    let covered = 0;
+    for (const chunk of chunkMarkdown(source, anchors)) {
+      assert.ok(chunk.start <= covered && chunk.end > covered);
+      covered = chunk.end;
+      assert.equal(chunk.text, source.slice(chunk.start, chunk.end));
+      assert.equal(chunk.startLine, source.slice(0, chunk.start).split("\n").length);
+      assert.equal(chunk.endLine, source.slice(0, chunk.end - 1).split("\n").length);
+      const expected = valid.findLast(({ offset }) => offset <= chunk.start)
+        ?? valid.find(({ offset }) => offset < chunk.end);
+      assert.deepEqual(chunk.anchor, expected ? { type: expected.type, value: expected.value } : undefined);
+    }
+    assert.equal(covered, source.length);
+  }
+});
+
 test("only Obsidian-confirmed headings and blocks become citation anchors", () => {
   const source = "```md\n# Not a heading\n^not-a-block\n```";
   assert.ok(chunkMarkdown(source).every(({ anchor }) => anchor === undefined));

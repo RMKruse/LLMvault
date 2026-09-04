@@ -87,7 +87,9 @@ interface MarkdownPiece {
   bytes: number;
   completeBlock: boolean;
   end: number;
+  endLine: number;
   start: number;
+  startLine: number;
 }
 
 const encoder = new TextEncoder();
@@ -101,15 +103,6 @@ function byteLength(value: string): number {
   return encoder.encode(value).byteLength;
 }
 
-function lineAt(source: string, offset: number, deadline = Number.POSITIVE_INFINITY): number {
-  let line = 1;
-  for (let index = 0; index < offset; index += 1) {
-    if (index % 4_096 === 0) assertWithinDeadline(deadline);
-    if (source.charCodeAt(index) === 10) line += 1;
-  }
-  return line;
-}
-
 function sourceBlocks(
   source: string,
   headingOffsets: Set<number>,
@@ -117,8 +110,10 @@ function sourceBlocks(
 ): MarkdownPiece[] {
   const blocks: MarkdownPiece[] = [];
   let blockStart = 0;
+  let blockStartLine = 1;
+  let lineNumber = 1;
   let offset = 0;
-  for (const line of source.matchAll(/.*(?:\n|$)/g)) {
+  for (const line of source.matchAll(/[^\n]*(?:\n|$)/g)) {
     assertWithinDeadline(deadline);
     const value = line[0];
     if (value.length === 0) continue;
@@ -128,9 +123,12 @@ function sourceBlocks(
         bytes: byteLength(source.slice(blockStart, offset)),
         completeBlock: true,
         end: offset,
+        endLine: lineNumber - 1,
         start: blockStart,
+        startLine: blockStartLine,
       });
       blockStart = offset;
+      blockStartLine = lineNumber;
     }
     offset += value.length;
     if (/^[ \t]*(?:\r?\n)$/.test(value)) {
@@ -138,17 +136,23 @@ function sourceBlocks(
         bytes: byteLength(source.slice(blockStart, offset)),
         completeBlock: true,
         end: offset,
+        endLine: lineNumber,
         start: blockStart,
+        startLine: blockStartLine,
       });
       blockStart = offset;
+      blockStartLine = lineNumber + 1;
     }
+    if (value.endsWith("\n")) lineNumber += 1;
   }
   if (blockStart < source.length) {
     blocks.push({
       bytes: byteLength(source.slice(blockStart)),
       completeBlock: true,
       end: source.length,
+      endLine: lineNumber - (source.endsWith("\n") ? 1 : 0),
       start: blockStart,
+      startLine: blockStartLine,
     });
   }
   return blocks.flatMap((block) => splitOversizedPiece(source, block, deadline));
@@ -163,15 +167,20 @@ function splitOversizedPiece(
   const split: MarkdownPiece[] = [];
   let packedStart = piece.start;
   let packedEnd = piece.start;
+  let packedStartLine = piece.startLine;
+  let packedEndLine = piece.startLine;
+  let lineNumber = piece.startLine;
   let packedBytes = 0;
-  for (const line of source.slice(piece.start, piece.end).matchAll(/.*(?:\n|$)/g)) {
+  for (const line of source.slice(piece.start, piece.end).matchAll(/[^\n]*(?:\n|$)/g)) {
     assertWithinDeadline(deadline);
     if (line[0].length === 0) continue;
     const lineStart = piece.start + line.index;
     const lineEnd = lineStart + line[0].length;
     const lineBytes = byteLength(line[0]);
+    const currentLine = lineNumber;
+    if (line[0].endsWith("\n")) lineNumber += 1;
     if (lineBytes > CHUNK_TARGET_BYTES) {
-      if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+      if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, endLine: packedEndLine, start: packedStart, startLine: packedStartLine });
       let start = lineStart;
       let end = start;
       let bytes = 0;
@@ -181,28 +190,31 @@ function splitOversizedPiece(
         characters += 1;
         const characterBytes = byteLength(character);
         if (bytes + characterBytes > CHUNK_TARGET_BYTES) {
-          split.push({ bytes, completeBlock: false, end, start });
+          split.push({ bytes, completeBlock: false, end, endLine: currentLine, start, startLine: currentLine });
           start = end;
           bytes = 0;
         }
         bytes += characterBytes;
         end += character.length;
       }
-      if (start < lineEnd) split.push({ bytes, completeBlock: false, end: lineEnd, start });
+      if (start < lineEnd) split.push({ bytes, completeBlock: false, end: lineEnd, endLine: currentLine, start, startLine: currentLine });
       packedStart = lineEnd;
       packedEnd = lineEnd;
       packedBytes = 0;
+      packedStartLine = lineNumber;
       continue;
     }
     if (packedBytes > 0 && packedBytes + lineBytes > CHUNK_TARGET_BYTES) {
-      split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+      split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, endLine: packedEndLine, start: packedStart, startLine: packedStartLine });
       packedStart = lineStart;
+      packedStartLine = currentLine;
       packedBytes = 0;
     }
     packedBytes += lineBytes;
     packedEnd = lineEnd;
+    packedEndLine = currentLine;
   }
-  if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, start: packedStart });
+  if (packedBytes > 0) split.push({ bytes: packedBytes, completeBlock: false, end: packedEnd, endLine: packedEndLine, start: packedStart, startLine: packedStartLine });
   return split;
 }
 
@@ -223,6 +235,8 @@ export function chunkMarkdown(
   );
   const chunks: MarkdownChunk[] = [];
   let cursor = 0;
+  let anchorCursor = 0;
+  let precedingAnchor: MarkdownAnchor | undefined;
 
   while (cursor < pieces.length) {
     assertWithinDeadline(deadline);
@@ -235,20 +249,25 @@ export function chunkMarkdown(
       bytes += pieces[cursor]?.bytes ?? 0;
       cursor += 1;
     }
-    const start = pieces[first]?.start;
-    const end = pieces[cursor - 1]?.end;
-    if (start === undefined || end === undefined) break;
-    let nearest = sortedAnchors.find((anchor) => anchor.offset < end);
-    for (const anchor of sortedAnchors) {
-      if (anchor.offset > start) break;
-      nearest = anchor;
+    const firstPiece = pieces[first];
+    const lastPiece = pieces[cursor - 1];
+    if (!firstPiece || !lastPiece) break;
+    const start = firstPiece.start;
+    const end = lastPiece.end;
+    while (anchorCursor < sortedAnchors.length) {
+      const anchor = sortedAnchors[anchorCursor];
+      if (!anchor || anchor.offset > start) break;
+      precedingAnchor = anchor;
+      anchorCursor += 1;
     }
+    const followingAnchor = sortedAnchors[anchorCursor];
+    const nearest = precedingAnchor ?? (followingAnchor && followingAnchor.offset < end ? followingAnchor : undefined);
     chunks.push({
       ...(nearest ? { anchor: { type: nearest.type, value: nearest.value } } : {}),
       end,
-      endLine: lineAt(source, Math.max(start, end - 1), deadline),
+      endLine: lastPiece.endLine,
       start,
-      startLine: lineAt(source, start, deadline),
+      startLine: firstPiece.startLine,
       text: source.slice(start, end),
     });
 
