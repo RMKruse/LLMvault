@@ -218,8 +218,7 @@ async function runCase(item, index, repetition, candidate) {
       }
     },
     retrieve: (question) => index.retrieve(question),
-    revalidateEvidence: async (retrieved) =>
-      (await Promise.all(retrieved.map((entry) => index.resolveEvidence(entry)))).filter(Boolean),
+    revalidateEvidence: (retrieved) => index.resolveEvidenceBatch(retrieved),
     chat: (messages, onContent) => client.chat(
       11434, candidate.chatModel.name, messages, onContent, true, { seed: 0, temperature: 0 },
     ),

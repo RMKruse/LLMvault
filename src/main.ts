@@ -420,20 +420,17 @@ class VaultChatView extends ItemView {
     if (!turn) return;
     const generation = ++this.displayGeneration;
     this.renderAnswer("Checking historical evidence…", "Restoring conversation", turn.question);
-    const current = await Promise.all(
-      turn.evidence.map(async (stored) => ({
-        stored,
-        current: await this.plugin.resolveEvidence(stored),
-      })),
+    const current = new Map(
+      (await this.plugin.revalidateEvidence(turn.evidence)).map((item) => [item.citationId, item]),
     );
     if (
       generation !== this.displayGeneration ||
       this.plugin.getConversationState().selectedConversationId !== conversation.id
     ) return;
     const unavailable = new Set(
-      current.filter(({ current }) => current === null).map(({ stored }) => stored.citationId),
+      turn.evidence.filter((item) => !current.has(item.citationId)).map((item) => item.citationId),
     );
-    this.renderEvidence(current.map(({ stored, current }) => current ?? stored), unavailable);
+    this.renderEvidence(turn.evidence.map((item) => current.get(item.citationId) ?? item), unavailable);
     this.renderAnswer(
       turn.answer,
       turn.kind === "answer"
@@ -1432,8 +1429,9 @@ export default class LLMvaultPlugin extends Plugin {
   }
 
   async revalidateEvidence(evidence: RetrievedEvidence[]): Promise<RetrievedEvidence[]> {
-    const current = await Promise.all(evidence.map((item) => this.resolveEvidence(item)));
-    return current.filter((item): item is RetrievedEvidence => item !== null);
+    if (this.isStopped()) return [];
+    const current = await this.index?.resolveEvidenceBatch(evidence) ?? [];
+    return this.isStopped() ? [] : current.filter((item) => this.evidenceFile(item) !== null);
   }
 
   async openSource(evidence: RetrievedEvidence): Promise<boolean> {

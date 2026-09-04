@@ -362,7 +362,7 @@ async function rendererSetup(config) {
     .reduce((sum, conversation) => sum + conversation.turns.length, 0);
   const currentEvidence = async (token, sourcePath) => {
     const evidence = (await plugin.retrieve(token)).filter(({ path }) => path === sourcePath);
-    const resolved = await Promise.all(evidence.map((item) => plugin.resolveEvidence(item)));
+    const resolved = await plugin.revalidateEvidence(evidence);
     return resolved.some((item) => item?.text.includes(token));
   };
   const expectedIsExposed = (expected) => {
@@ -587,8 +587,7 @@ async function rendererSetup(config) {
         invalid ||= !paths.has(expected.path);
         invalid ||= entries.find(({ path }) => path === expected.path)?.fingerprint !== expected.fingerprint;
         const evidence = await plugin.retrieve(expected.token);
-        const current = await Promise.all(evidence.filter(({ path }) => path === expected.path)
-          .map((item) => plugin.resolveEvidence(item)));
+        const current = await plugin.revalidateEvidence(evidence.filter(({ path }) => path === expected.path));
         invalid ||= !current.some((item) => item?.text.includes(expected.token));
         invalid ||= Boolean(expected.oldToken) && current.some((item) => item?.text.includes(expected.oldToken));
       } else {

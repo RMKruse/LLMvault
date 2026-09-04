@@ -8,7 +8,7 @@ import {
   type RuntimeEntry, type StoredChunk, type ValidatedGeneration,
 } from "./index-storage.ts";
 import {
-  chunksForPaths, hydrate, hydrateCandidates, rankChunks,
+  chunksForPaths, hydrateCandidates, rankChunks,
   type RetrievedEvidence,
 } from "./index-retrieval.ts";
 
@@ -166,26 +166,34 @@ export class VaultIndex {
   }
 
   async resolveEvidence(evidence: RetrievedEvidence): Promise<RetrievedEvidence | null> {
-    if (!isStoredLocator(evidence) || !this.hasEvidence(evidence)) return null;
-    const source = this.listSources().find(({ path }) => path === evidence.path);
-    if (!source) {
-      if (this.active) this.queueReplacement(this.active.model);
-      return null;
-    }
-    const entry: SourceEntry = {
-      fingerprint: evidence.fingerprint,
-      path: evidence.path,
-      sourceKey: evidence.chunkId.split(":", 1)[0] ?? "",
-      status: "indexed",
-    };
-    const chunk = {
-      id: evidence.chunkId,
-      locator: locatorFor(evidence.path, evidence),
-    };
-    const hydrated = await hydrate(entry, chunk, evidence.score, source);
-    if (!this.hasEvidence(evidence)) return null;
-    if (!hydrated && this.active) this.queueReplacement(this.active.model);
-    return hydrated ? { ...hydrated, citationId: evidence.citationId } : null;
+    return (await this.resolveEvidenceBatch([evidence]))[0] ?? null;
+  }
+
+  async resolveEvidenceBatch(evidence: RetrievedEvidence[]): Promise<RetrievedEvidence[]> {
+    const active = this.active;
+    const revision = this.revision;
+    if (!active) return [];
+    const candidates = evidence
+      .filter((item) => isStoredLocator(item) && this.hasEvidence(item))
+      .map((item) => ({
+        citationId: item.citationId,
+        entry: {
+          fingerprint: item.fingerprint,
+          path: item.path,
+          sourceKey: item.chunkId.split(":", 1)[0] ?? "",
+          status: "indexed" as const,
+        },
+        chunk: { id: item.chunkId, locator: locatorFor(item.path, item) },
+        score: item.score,
+      }));
+    if (candidates.length === 0) return [];
+    const { evidence: current, stale } = await hydrateCandidates(
+      candidates, this.listSources(), candidates.length, this.querySequence,
+      () => revision === this.revision,
+    );
+    if (revision !== this.revision) return [];
+    if (stale) this.queueReplacement(active.model);
+    return current;
   }
 
   // ponytail: rebuild the whole generation; go per-source only if change latency becomes material.

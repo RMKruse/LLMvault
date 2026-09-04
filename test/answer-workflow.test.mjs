@@ -32,6 +32,27 @@ class Element {
 const discovery = { version: "0.33.2", installedModelCount: 2, chatModels: ["chat"], embeddingModels: ["embed"], remoteModels: [], modelDigests: {} };
 const evidence = [{ citationId: "S1-1", text: "A fact", path: "note.md" }];
 
+test("production revalidation uses one batch and checks file availability and stopped state", async () => {
+  let calls = 0, stopped = false;
+  const missing = { ...evidence[0], path: "missing.md" };
+  const plugin = {
+    isStopped: () => stopped,
+    evidenceFile: (item) => item.path === "missing.md" ? null : {},
+    index: {
+      async resolveEvidenceBatch(items) { calls += 1; return items; },
+    },
+  };
+  const revalidate = (items) => LLMvaultPlugin.prototype.revalidateEvidence.call(plugin, items);
+  assert.deepEqual(await revalidate([...evidence, missing]), evidence);
+  assert.equal(calls, 1);
+  stopped = true;
+  assert.deepEqual(await revalidate(evidence), []);
+  assert.equal(calls, 1);
+  stopped = false;
+  plugin.index.resolveEvidenceBatch = async (items) => { stopped = true; return items; };
+  assert.deepEqual(await revalidate(evidence), []);
+});
+
 function harness() {
   const saved = [];
   const plugin = {
@@ -78,6 +99,24 @@ test("discovery finishes after a question and releases setup controls", async ()
   assert.equal(view.answering, false);
   assert.equal(view.busy, false);
   assert.equal(view.setupEl.find("Complete setup").disabled, false);
+});
+
+test("historical evidence resolves in one batch and retains unavailable citations", async () => {
+  const { view, plugin } = harness();
+  const missing = { ...evidence[0], citationId: "S1-2", path: "missing.md" };
+  const stored = [...evidence, missing];
+  plugin.getConversationState = () => ({
+    selectedConversationId: "saved",
+    conversations: [{ id: "saved", turns: [{ evidence: stored, question: "Question", answer: "Answer", kind: "answer" }] }],
+  });
+  let batches = 0;
+  plugin.revalidateEvidence = async (items) => { batches += 1; assert.equal(items, stored); return evidence; };
+  view.renderEvidence = (items, unavailable) => {
+    assert.deepEqual(items, stored);
+    assert.deepEqual([...unavailable], [missing.citationId]);
+  };
+  await view.renderSelectedConversation();
+  assert.equal(batches, 1);
 });
 
 test("production saves lowercase insufficient_evidence as abstention", async () => {

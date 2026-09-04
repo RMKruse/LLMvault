@@ -69,6 +69,100 @@ class MemoryAdapter {
 const generationFolders = (adapter) =>
   [...adapter.folders].filter((path) => path.match(/\/generations\/[^/]+$/));
 
+test("evidence batches prepare each source once per stage and reread between stages", async (t) => {
+  let reads = 0, enumerations = 0;
+  let text = "x".repeat(CHUNK_TARGET_BYTES * 6);
+  const index = new VaultIndex(
+    new MemoryAdapter(), "plugin/index-v1",
+    () => {
+      enumerations += 1;
+      return [{ path: "Note.md", read: async () => { reads += 1; return text; } }];
+    },
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  reads = enumerations = 0;
+  const evidence = await index.retrieve("question");
+  assert.equal(evidence.length, 6);
+  const resolved = await index.resolveEvidenceBatch(evidence);
+  assert.deepEqual(resolved, evidence);
+  assert.deepEqual({ reads, enumerations }, { reads: 2, enumerations: 2 });
+
+  const replacement = t.mock.method(index, "queueReplacement", () => {});
+  text = text.replace("x", "y");
+  assert.deepEqual(await index.resolveEvidenceBatch(evidence), []);
+  assert.deepEqual({ reads, enumerations }, { reads: 3, enumerations: 3 });
+  assert.equal(replacement.mock.callCount(), 1);
+});
+
+test("mixed evidence batches preserve order and citations while rejecting stale locators and sources", async (t) => {
+  let enumerations = 0;
+  const reads = { "Note.md": 0, "Board.canvas": 0 };
+  const contents = {
+    "Note.md": Array(3).fill("x".repeat(1_600)).join("\n\n"),
+    "Board.canvas": JSON.stringify({
+      nodes: [1, 2, 3].map((id) => ({ id: String(id), type: "text", text: `Card ${id}`, x: 0, y: 0, width: 100, height: 100 })),
+      edges: [],
+    }),
+  };
+  const index = new VaultIndex(
+    new MemoryAdapter(), "plugin/index-v1",
+    () => {
+      enumerations += 1;
+      return Object.keys(contents).map((path) => ({
+        path, kind: path.endsWith(".canvas") ? "canvas" : "markdown",
+        read: async () => { reads[path] += 1; return contents[path]; },
+      }));
+    },
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  const retrieved = await index.retrieve("question");
+  const markdown = retrieved.filter((item) => item.format === "markdown");
+  const canvas = retrieved.filter((item) => item.format === "canvas");
+  assert.equal(markdown.length, 3);
+  assert.equal(canvas.length, 3);
+  const evidence = markdown.flatMap((item, i) => [item, canvas[i]]).reverse();
+  reads["Note.md"] = reads["Board.canvas"] = enumerations = 0;
+  const replacement = t.mock.method(index, "queueReplacement", () => {});
+  const malformed = { ...markdown[0], startLine: 0 };
+  const staleLocator = { ...canvas[0], nodeId: "missing" };
+  assert.deepEqual(await index.resolveEvidenceBatch([malformed, staleLocator, ...evidence]), evidence);
+  assert.deepEqual(reads, { "Note.md": 1, "Board.canvas": 1 });
+  assert.equal(enumerations, 1);
+  assert.equal(replacement.mock.callCount(), 1);
+
+  delete contents["Board.canvas"];
+  assert.deepEqual(await index.resolveEvidenceBatch(evidence), evidence.filter((item) => item.format === "markdown"));
+  assert.equal(replacement.mock.callCount(), 2);
+  assert.deepEqual(await index.resolveEvidenceBatch([]), []);
+  assert.equal(enumerations, 2);
+});
+
+test("invalidation during batch preparation discards evidence already hydrated", async () => {
+  let pause;
+  const entered = Promise.withResolvers(), released = Promise.withResolvers();
+  const index = new VaultIndex(
+    new MemoryAdapter(), "plugin/index-v1",
+    () => ["First.md", "Second.md"].map((path) => ({
+      path,
+      read: async () => {
+        if (path === pause) { entered.resolve(); await released.promise; }
+        return path;
+      },
+    })),
+    async (inputs) => inputs.map(() => [1]),
+  );
+  await index.start({ name: "embed", digest: "sha256:abc" });
+  const evidence = await index.retrieve("question");
+  pause = evidence[1].path;
+  const resolution = index.resolveEvidenceBatch(evidence);
+  await entered.promise;
+  index.cancel();
+  released.resolve();
+  assert.deepEqual(await resolution, []);
+});
+
 test("saved evidence resolves after restoration and malformed locators are unavailable", async () => {
   const index = new VaultIndex(
     new MemoryAdapter(), "plugin/index-v1",

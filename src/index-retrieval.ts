@@ -1,7 +1,7 @@
 import { minimumScoreFor } from "./quality.ts";
 import {
   exactSourceMatch, locatorFor, prepareSource, sameLocator,
-  type SourceEntry, type StoredLocator, type VaultSource,
+  type PreparedSource, type SourceEntry, type StoredLocator, type VaultSource,
 } from "./index-source.ts";
 import type { ValidatedGeneration } from "./index-storage.ts";
 
@@ -62,6 +62,7 @@ export function resolveDailyRecapRequest(
 }
 
 interface Candidate {
+  citationId?: string;
   chunk: { id: string; locator: StoredLocator };
   entry: SourceEntry;
   score: number;
@@ -111,38 +112,44 @@ export async function hydrateCandidates(
   isCurrent: () => boolean,
 ): Promise<{ evidence: RetrievedEvidence[]; stale: boolean }> {
   const sourcesByPath = new Map(sources.map((source) => [source.path, source]));
+  // Prepared plaintext belongs to this validation stage only.
+  const preparedByPath = new Map<string, PreparedSource>();
   const evidence: RetrievedEvidence[] = [];
   let stale = false;
-  for (const { entry, chunk, score } of candidates) {
+  for (const { entry, chunk, score, citationId } of candidates) {
     const source = sourcesByPath.get(entry.path);
-    const hydrated = source ? await hydrate(entry, chunk, score, source) : null;
+    let prepared = preparedByPath.get(entry.path);
+    if (!prepared && source) {
+      prepared = await prepareSource(source);
+      preparedByPath.set(entry.path, prepared);
+    }
     if (!isCurrent()) return { evidence: [], stale: false };
+    const hydrated = prepared ? hydrate(entry, chunk, score, prepared) : null;
     if (!hydrated) {
       stale = true;
       continue;
     }
-    evidence.push({ ...hydrated, citationId: `S${queryId}-${evidence.length + 1}` });
+    evidence.push({ ...hydrated, citationId: citationId ?? `S${queryId}-${evidence.length + 1}` });
     if (evidence.length >= limit) break;
   }
   return { evidence, stale };
 }
 
-export async function hydrate(
+function hydrate(
   entry: SourceEntry,
   stored: { id: string; locator: StoredLocator },
   score: number,
-  source: VaultSource,
-): Promise<UncitedEvidence | null> {
-  const prepared = await prepareSource(source);
+  prepared: PreparedSource,
+): UncitedEvidence | null {
   if (
     prepared.entry.status !== "indexed" || !exactSourceMatch(prepared.entry, entry)
   ) {
     return null;
   }
-  const chunk = prepared.chunks.find((item) => sameLocator(stored.locator, locatorFor(source.path, item)));
+  const chunk = prepared.chunks.find((item) => sameLocator(stored.locator, locatorFor(entry.path, item)));
   if (!chunk || !entry.fingerprint) return null;
   return {
-    ...locatorFor(source.path, chunk),
+    ...locatorFor(entry.path, chunk),
     chunkId: stored.id,
     fingerprint: entry.fingerprint,
     score,

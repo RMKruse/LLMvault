@@ -91,7 +91,7 @@ export async function groundedCase(question, history) {
     const running = await globalThis.fetch("http://127.0.0.1:11434/api/ps").then((r) => r.json());
     const modelsAfter = await globalThis.fetch("http://127.0.0.1:11434/api/tags").then((r) => r.json());
     const evidence = [...view.citationRegistry.values()];
-    const resolved = await Promise.all(evidence.map((entry) => plugin.resolveEvidence(entry)));
+    const resolved = await plugin.revalidateEvidence(evidence);
     const selected = plugin.getConversationState().conversations.find(({ id }) => id === plugin.getConversationState().selectedConversationId);
     return {
       ...observations, question, prior, evidence, expectedEvidence, expectedPaths,
