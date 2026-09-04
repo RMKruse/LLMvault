@@ -33,22 +33,22 @@ export interface IndexSnapshot {
   total: number;
 }
 
-export class VaultIndex {
-  private active?: ValidatedGeneration & { model: EmbeddingModel };
+export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
+  private active?: ValidatedGeneration & { model: Readonly<Model> };
   private readonly storage: GenerationStorage;
   private deleteOperation?: Promise<void>;
   private drain?: Promise<IndexSnapshot>;
   private readonly embed: (
     inputs: string[],
-    model: EmbeddingModel,
+    model: Readonly<Model>,
   ) => Promise<number[][]>;
   private readonly listSources: () => VaultSource[];
   private readonly onProgress: (snapshot: IndexSnapshot) => void;
-  private model?: EmbeddingModel;
+  private model?: Readonly<Model>;
   private readonly pendingPaths = new Set<string>();
   private readonly queryEmbed: (
     inputs: string[],
-    model: EmbeddingModel,
+    model: Readonly<Model>,
   ) => Promise<number[][]>;
   private querySequence = 0;
   private rebuildQueued = false;
@@ -56,16 +56,16 @@ export class VaultIndex {
   private replacementQueued = false;
   private revision = 0;
   private snapshot: IndexSnapshot = { available: false, completed: 0, outcomes: [], phase: "idle", statuses: {}, total: 0 };
-  private readonly validateModel: (model: EmbeddingModel) => Promise<boolean>;
+  private readonly validateModel: (model: Readonly<Model>) => Promise<boolean>;
 
   constructor(
     adapter: IndexAdapter,
     root: string,
     listSources: () => VaultSource[],
-    embed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]>,
+    embed: (inputs: string[], model: Readonly<Model>) => Promise<number[][]>,
     onProgress: (snapshot: IndexSnapshot) => void = () => undefined,
-    queryEmbed: (inputs: string[], model: EmbeddingModel) => Promise<number[][]> = embed,
-    validateModel: (model: EmbeddingModel) => Promise<boolean> = async () => true,
+    queryEmbed: (inputs: string[], model: Readonly<Model>) => Promise<number[][]> = embed,
+    validateModel: (model: Readonly<Model>) => Promise<boolean> = async () => true,
   ) {
     this.storage = new GenerationStorage(adapter, root);
     this.listSources = listSources;
@@ -233,7 +233,7 @@ export class VaultIndex {
     ) ?? false;
   }
 
-  private queueReplacement(model: EmbeddingModel): void {
+  private queueReplacement(model: Readonly<Model>): void {
     if (this.replacementQueued) return;
     this.replacementQueued = true;
     void this.start(model).finally(() => {
@@ -241,9 +241,9 @@ export class VaultIndex {
     });
   }
 
-  start(model: EmbeddingModel): Promise<IndexSnapshot> {
+  start(model: Readonly<Model>): Promise<IndexSnapshot> {
     if (this.deleteOperation) return this.deleteOperation.then(() => this.getSnapshot());
-    this.model = model;
+    this.model = Object.freeze({ ...model });
     this.rebuildQueued = true;
     this.revision += 1;
     if (validModel(model)) {
@@ -252,7 +252,7 @@ export class VaultIndex {
     return this.queueDrain();
   }
 
-  rebuild(model: EmbeddingModel): Promise<IndexSnapshot> {
+  rebuild(model: Readonly<Model>): Promise<IndexSnapshot> {
     if (this.deleteOperation) return this.deleteOperation.then(() => this.getSnapshot());
     this.forceRebuild = true;
     return this.start(model);
@@ -280,7 +280,7 @@ export class VaultIndex {
   }
 
   private async run(
-    model: EmbeddingModel,
+    model: Readonly<Model>,
     revision: number,
     force: boolean,
     replacementPaths: Set<string>,
@@ -318,7 +318,7 @@ export class VaultIndex {
   }
 
   private async restore(
-    model: EmbeddingModel,
+    model: Readonly<Model>,
     sources: VaultSource[],
     revision: number,
   ): Promise<IndexSnapshot | null> {
@@ -358,7 +358,7 @@ export class VaultIndex {
   }
 
   private async build(
-    model: EmbeddingModel,
+    model: Readonly<Model>,
     sources: VaultSource[],
     revision: number,
     replacementPaths: Set<string>,

@@ -611,7 +611,8 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
     path,
     read: async () => texts.get(path),
   }));
-  const model = { name: "pinned-embed", digest: "sha256:pinned" };
+  const model = { name: "pinned-embed", digest: "sha256:pinned", port: 11434 };
+  const captured = { ...model };
   const models = [];
   const validatedModels = [];
   const embed = async (inputs, requestedModel) => {
@@ -632,7 +633,9 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
       return true;
     },
   );
-  await index.start(model);
+  const build = index.start(model);
+  Object.assign(model, { name: "changed", digest: "changed", port: 11435 });
+  await build;
 
   const evidence = await index.retrieve("Which source is strongest?");
 
@@ -651,7 +654,10 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
     (await index.retrieve("Which source is strongest?", false, 4)).map(({ path }) => path),
     ["seven.md", "six.md", "five.md", "four.md"],
   );
-  assert.ok(models.every((requestedModel) => requestedModel === model));
+  for (const requestedModel of models) {
+    assert.deepEqual(requestedModel, captured);
+    assert.equal(Object.isFrozen(requestedModel), true);
+  }
 
   texts.set("seven.md", "changed after indexing");
   const freshEvidence = await index.retrieve("Which source is strongest?");
@@ -660,7 +666,7 @@ test("questions retrieve at most six fresh sources with the generation's pinned 
     freshEvidence.map(({ path }) => path),
     ["six.md", "five.md", "four.md", "three.md", "two.md", "one.md"],
   );
-  assert.deepEqual(validatedModels, [model, model]);
+  assert.deepEqual(validatedModels, [captured, captured]);
   assert.equal(index.getSnapshot().phase, "indexing");
 });
 

@@ -138,6 +138,7 @@ test("an older settings save failure cannot undo deletion's stop barrier", async
 test("an in-flight resume cannot release a newer deletion barrier", async () => {
   const Plugin = await loadPlugin();
   const plugin = new Plugin();
+  plugin.llmvaultSettings = { ollamaPort: 11434, chatModel: "chat", embeddingModel: "embed" };
   plugin.stopped = true;
   const resumeStarted = Promise.withResolvers();
   const resumeSave = Promise.withResolvers();

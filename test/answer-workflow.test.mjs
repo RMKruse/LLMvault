@@ -32,6 +32,166 @@ class Element {
 const discovery = { version: "0.33.2", installedModelCount: 2, chatModels: ["chat"], embeddingModels: ["embed"], remoteModels: [], modelDigests: {} };
 const evidence = [{ citationId: "S1-1", text: "A fact", path: "note.md" }];
 
+async function indexingPlugin() {
+  const plugin = new LLMvaultPlugin();
+  const files = new Map(), folders = new Set();
+  const adapter = {
+    async exists(path) { return files.has(path) || folders.has(path); },
+    async mkdir(path) { folders.add(path); },
+    async read(path) { if (!files.has(path)) throw new Error("missing"); return files.get(path); },
+    async write(path, value) { files.set(path, value); },
+    async process(path, update) { files.set(path, update(files.get(path) ?? "")); },
+    async list(path) {
+      const direct = (item) => item.startsWith(`${path}/`) && !item.slice(path.length + 1).includes("/");
+      return { files: [...files.keys()].filter(direct), folders: [...folders].filter(direct) };
+    },
+    async rmdir(path) {
+      for (const collection of [files, folders]) {
+        for (const key of collection.keys()) if (key === path || key.startsWith(`${path}/`)) collection.delete(key);
+      }
+    },
+  };
+  plugin.loadData = async () => ({ ollamaPort: 11434, chatModel: "chat", embeddingModel: "embed" });
+  plugin.saveData = async () => {};
+  plugin.manifest = { dir: "plugin" };
+  plugin.app = { vault: { adapter, on() {} }, workspace: { onLayoutReady() {} } };
+  for (const method of ["registerView", "addCommand", "addRibbonIcon", "registerEvent"]) plugin[method] = () => {};
+  plugin.vaultSources = () => [{ path: "Note.md", read: async () => "x".repeat(80_000) }];
+  plugin.indexOllama.validatePinnedModel = async () => "compatible";
+  await plugin.onload();
+  return plugin;
+}
+
+test("settings changes during a paused embedding batch cannot commit a mixed generation", async () => {
+  const plugin = await indexingPlugin();
+  const entered = deferred(), pending = deferred(), ports = [];
+  plugin.indexOllama.embed = async (port, model, inputs) => {
+    ports.push(port);
+    if (ports.length === 1) { entered.resolve(); await pending.promise; }
+    return inputs.map(() => [1, 0]);
+  };
+  const build = plugin.startIndexing({ ...discovery, modelDigests: { embed: "original-digest" } }, "embed");
+  await entered.promise;
+  await plugin.saveSettings({ ollamaPort: 11435, chatModel: "chat", embeddingModel: null });
+  pending.resolve();
+  await build;
+  assert.ok(ports.every((port) => port === 11434), `mixed connections: ${ports}`);
+  assert.notEqual(plugin.getIndexSnapshot().phase, "ready");
+  assert.equal(plugin.index.getSignature(), null);
+});
+
+test("failed setup stays in the form while every running batch uses its captured connection", async () => {
+  for (const failedRole of ["completion", "embedding"]) {
+    const plugin = await indexingPlugin();
+    const entered = deferred(), pending = deferred(), ports = [];
+    plugin.indexOllama.embed = async (port, model, inputs) => {
+      ports.push(port);
+      if (ports.length === 1) { entered.resolve(); await pending.promise; }
+      return inputs.map(() => [1, 0]);
+    };
+    let writes = 0;
+    plugin.saveData = async () => { writes += 1; };
+    plugin.ollama.validateModel = async (port, model, role) => role === failedRole ? "incompatible" : "compatible";
+    const build = plugin.startIndexing({ ...discovery, modelDigests: { embed: "original-digest" } }, "embed");
+    await entered.promise;
+    const view = new VaultChatView({}, plugin);
+    view.portValue = "11435";
+    view.discovery = discovery;
+    view.renderSetup = () => {};
+    await view.completeSetup();
+    assert.equal(writes, 0);
+    assert.deepEqual(plugin.getSettings(), { ollamaPort: 11434, chatModel: "chat", embeddingModel: "embed" });
+    assert.equal(view[failedRole === "completion" ? "chatModel" : "embeddingModel"], null);
+    pending.resolve();
+    await build;
+    assert.deepEqual(ports, [11434, 11434, 11434]);
+    assert.equal(plugin.getIndexSnapshot().phase, "ready");
+    assert.equal(plugin.index.getSignature().embeddingModelDigest, "original-digest");
+  }
+});
+
+test("successful setup replaces a paused build only after durable settings publication", async () => {
+  const plugin = await indexingPlugin();
+  const entered = deferred(), pending = deferred(), saving = deferred(), saved = deferred();
+  const ports = [], validations = [];
+  plugin.indexOllama.validatePinnedModel = async (port, model, digest) => {
+    validations.push([port, digest]);
+    return "compatible";
+  };
+  plugin.indexOllama.embed = async (port, model, inputs) => {
+    ports.push(port);
+    if (ports.length === 1) { entered.resolve(); await pending.promise; }
+    return inputs.map(() => [port === 11434 ? 1 : 0, 1]);
+  };
+  const build = plugin.startIndexing({ ...discovery, modelDigests: { embed: "original-digest" } }, "embed");
+  await entered.promise;
+  const revision = plugin.index.revision;
+  plugin.saveData = async () => { saving.resolve(); await saved.promise; };
+  plugin.ollama.validateModel = async () => "compatible";
+  const view = new VaultChatView({}, plugin);
+  view.portValue = "11435";
+  view.discovery = { ...discovery, modelDigests: { embed: "new-digest" } };
+  view.renderSetup = view.showChat = () => {};
+  const setup = view.completeSetup();
+  await saving.promise;
+  assert.equal(plugin.getSettings().ollamaPort, 11434);
+  saved.resolve();
+  await setup;
+  assert.ok(plugin.index.revision > revision);
+  assert.equal(plugin.getSettings().ollamaPort, 11435);
+  pending.resolve();
+  await build;
+  assert.deepEqual(ports, [11434, 11435, 11435, 11435]);
+  assert.deepEqual(validations, [[11434, "original-digest"], [11435, "new-digest"]]);
+  assert.equal(plugin.getIndexSnapshot().phase, "ready");
+  assert.equal(plugin.index.getSignature().embeddingModelDigest, "new-digest");
+
+  // Retrieval and file-change rebuilds retain the generation's connection, too.
+  await plugin.saveSettings({ ollamaPort: 11436, chatModel: "chat", embeddingModel: null });
+  plugin.queryOllama.validatePinnedModel = async (port, model, digest) => {
+    assert.deepEqual([port, digest], [11435, "new-digest"]);
+    return "compatible";
+  };
+  plugin.queryOllama.embed = async (port) => { assert.equal(port, 11435); return [[0, 1]]; };
+  assert.ok((await plugin.index.retrieve("question")).length > 0);
+  await plugin.index.invalidate(["Note.md"]);
+  assert.deepEqual(ports.slice(-3), [11435, 11435, 11435]);
+  assert.deepEqual(validations.at(-1), [11435, "new-digest"]);
+});
+
+test("a failed settings write preserves the running build and active connection", async () => {
+  const plugin = await indexingPlugin();
+  const entered = deferred(), pending = deferred(), ports = [];
+  plugin.indexOllama.embed = async (port, model, inputs) => {
+    ports.push(port);
+    if (ports.length === 1) { entered.resolve(); await pending.promise; }
+    return inputs.map(() => [1]);
+  };
+  const build = plugin.startIndexing({ ...discovery, modelDigests: { embed: "original-digest" } }, "embed");
+  await entered.promise;
+  plugin.saveData = async () => { throw new Error("write failed"); };
+  await assert.rejects(plugin.saveSettings({ ollamaPort: 11435, chatModel: "chat", embeddingModel: null }), /write failed/);
+  assert.equal(plugin.getSettings().ollamaPort, 11434);
+  pending.resolve();
+  await build;
+  assert.deepEqual(ports, [11434, 11434, 11434]);
+  assert.equal(plugin.getIndexSnapshot().phase, "ready");
+});
+
+test("startup discovery cannot start an old model on a newly saved connection", async () => {
+  const plugin = await indexingPlugin();
+  const entered = deferred(), pending = deferred();
+  plugin.discoverModels = async () => { entered.resolve(); return pending.promise; };
+  let starts = 0;
+  plugin.startIndexing = async () => { starts += 1; };
+  const restore = plugin.restoreIndex();
+  await entered.promise;
+  await plugin.saveSettings({ ollamaPort: 11435, chatModel: "chat", embeddingModel: "embed" });
+  pending.resolve({ ...discovery, modelDigests: { embed: "old-digest" } });
+  await restore;
+  assert.equal(starts, 0);
+});
+
 test("production revalidation uses one batch and checks file availability and stopped state", async () => {
   let calls = 0, stopped = false;
   const missing = { ...evidence[0], path: "missing.md" };
@@ -196,14 +356,13 @@ test("an older answer cannot complete or clear the newer answer's ownership", as
   assert.equal(saved[0].answer, "Current");
 });
 
-test("closing the view invalidates setup, including completion after a settings save", async () => {
-  for (const stage of ["discoverModels", "validateModel", "saveSettings", "resumeVaultChat"]) {
+test("closing the view suppresses late setup UI and unsubmitted configuration", async () => {
+  for (const stage of ["discoverModels", "validateModel", "saveSettings"]) {
     const { view, plugin } = harness();
     const entered = deferred(), pending = deferred();
-    let resumed = false, shown = false;
+    let applied = false, shown = false;
     plugin.validateModel = async () => "compatible";
-    plugin.saveSettings = async () => {};
-    plugin.resumeVaultChat = async () => { resumed = true; };
+    plugin.saveSettings = async () => { applied = true; };
     const original = plugin[stage];
     plugin[stage] = async (...args) => { entered.resolve(); await pending.promise; return original(...args); };
     view.discovery = discovery;
@@ -217,7 +376,7 @@ test("closing the view invalidates setup, including completion after a settings 
     assert.equal(view.status, statusAtClose, stage);
     assert.equal(view.busy, false, stage);
     assert.equal(shown, false, stage);
-    if (stage !== "resumeVaultChat") assert.equal(resumed, false, stage);
+    assert.equal(applied, stage === "saveSettings", stage);
   }
 });
 

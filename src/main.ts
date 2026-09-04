@@ -1,6 +1,7 @@
 import { ItemView, Plugin, type TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 
 import {
+  type EmbeddingModel,
   type IndexSnapshot,
   type MarkdownAnchor,
   VaultIndex,
@@ -990,14 +991,6 @@ class VaultChatView extends ItemView {
         this.managementOpen = true;
         this.renderLayout();
       }
-      if (
-        saved.ollamaPort === port &&
-        (saved.chatModel !== this.chatModel ||
-          saved.embeddingModel !== this.embeddingModel)
-      ) {
-        await this.plugin.saveSettings(revalidated.settings);
-      }
-      if (setupGeneration !== this.setupGeneration) return;
       this.status = this.discoveryStatus(revalidated.recoveryCodes);
     } catch (error) {
       if (setupGeneration !== this.setupGeneration) return;
@@ -1039,14 +1032,6 @@ class VaultChatView extends ItemView {
       if (setupGeneration !== this.setupGeneration) return;
       if (chat !== "compatible") {
         this.chatModel = null;
-        const saved = this.plugin.getSettings();
-        await this.plugin.saveSettings({
-          ollamaPort: port,
-          chatModel: null,
-          embeddingModel:
-            saved.ollamaPort === port ? saved.embeddingModel : null,
-        });
-        if (setupGeneration !== this.setupGeneration) return;
         this.status = RECOVERY_MESSAGES[
           chat === "remote"
             ? "remote_model_disallowed"
@@ -1063,12 +1048,6 @@ class VaultChatView extends ItemView {
       if (setupGeneration !== this.setupGeneration) return;
       if (embedding !== "compatible") {
         this.embeddingModel = null;
-        await this.plugin.saveSettings({
-          ollamaPort: port,
-          chatModel,
-          embeddingModel: null,
-        });
-        if (setupGeneration !== this.setupGeneration) return;
         this.status = RECOVERY_MESSAGES[
           embedding === "remote"
             ? "remote_model_disallowed"
@@ -1077,11 +1056,9 @@ class VaultChatView extends ItemView {
         return;
       }
 
-      await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel });
+      await this.plugin.saveSettings({ ollamaPort: port, chatModel, embeddingModel }, this.discovery);
       if (setupGeneration !== this.setupGeneration) return;
       this.status = "Setup complete. Both Local Models are compatible; indexing is starting.";
-      await this.plugin.resumeVaultChat(this.discovery, embeddingModel);
-      if (setupGeneration !== this.setupGeneration) return;
       this.showChat();
     } catch (error) {
       if (setupGeneration !== this.setupGeneration) return;
@@ -1140,7 +1117,8 @@ export default class LLMvaultPlugin extends Plugin {
   private deletionBarrier = false;
   private deletionPending = false;
   private deleteOperation?: Promise<void>;
-  private index?: VaultIndex;
+  private configurationRevision = 0;
+  private index?: VaultIndex<EmbeddingModel & { port: number }>;
   private indexSnapshot: IndexSnapshot = {
     available: false,
     completed: 0,
@@ -1168,19 +1146,15 @@ export default class LLMvaultPlugin extends Plugin {
       "vaultChatStopped" in data && data.vaultChatStopped === true);
     const pluginDirectory = this.manifest.dir;
     if (pluginDirectory) {
-      this.index = new VaultIndex(
+      this.index = new VaultIndex<EmbeddingModel & { port: number }>(
         this.app.vault.adapter,
         `${pluginDirectory}/index-v1`,
         () => this.vaultSources(),
-        (inputs, model) => {
-          const settings = this.getSettings();
-          return this.indexOllama.embed(settings.ollamaPort, model.name, inputs);
-        },
+        (inputs, model) => this.indexOllama.embed(model.port, model.name, inputs),
         (snapshot) => this.reportIndex(snapshot),
         async (inputs, model) => {
-          const settings = this.getSettings();
           const validation = await this.queryOllama.validatePinnedModel(
-            settings.ollamaPort,
+            model.port,
             model.name,
             model.digest,
             "embedding",
@@ -1193,13 +1167,12 @@ export default class LLMvaultPlugin extends Plugin {
               "/api/embed",
             );
           }
-          return await this.queryOllama.embed(settings.ollamaPort, model.name, inputs);
+          return await this.queryOllama.embed(model.port, model.name, inputs);
         },
         async (model) => {
-          const settings = this.getSettings();
           return (
             (await this.indexOllama.validatePinnedModel(
-              settings.ollamaPort,
+              model.port,
               model.name,
               model.digest,
               "embedding",
@@ -1253,9 +1226,22 @@ export default class LLMvaultPlugin extends Plugin {
     return this.deletionBarrier || this.deletionPending;
   }
 
-  async saveSettings(settings: LLMvaultSettings): Promise<void> {
+  async saveSettings(settings: LLMvaultSettings, setup?: OllamaDiscovery): Promise<void> {
     const normalized = normalizeSettings(settings);
-    await this.updateData(() => ({ llmvaultSettings: normalized }));
+    const discovery = setup ? { ...setup, modelDigests: { ...setup.modelDigests } } : undefined;
+    await this.updateData(() => {
+      if (discovery) {
+        if (this.deleteOperation) throw new Error("vault_chat_deletion_in_progress");
+        if (this.isDeletionIncomplete()) throw new Error("vault_chat_deletion_incomplete");
+        if (!normalized.chatModel || !normalized.embeddingModel || !discovery.modelDigests[normalized.embeddingModel]) {
+          throw new OllamaError("embedding_model_unavailable", "/api/embed");
+        }
+      }
+      return { llmvaultSettings: normalized, ...(discovery ? { stopped: false } : {}) };
+    });
+    if (discovery && normalized === this.llmvaultSettings && normalized.embeddingModel) {
+      void this.startIndexing(discovery, normalized.embeddingModel);
+    }
   }
 
   getConversationState(): ConversationState {
@@ -1474,6 +1460,13 @@ export default class LLMvaultPlugin extends Plugin {
         vaultChatDeletionPending: proposed.deletionPending,
         vaultChatStopped: proposed.stopped,
       });
+      if (proposed.llmvaultSettings !== this.llmvaultSettings) {
+        // Invalidate work before publishing a durably saved connection.
+        this.configurationRevision += 1;
+        this.index?.cancel();
+        this.indexOllama.abortAll();
+        this.abortAnswerRequests();
+      }
       this.llmvaultSettings = proposed.llmvaultSettings;
       this.conversationState = proposed.conversationState;
       this.deletionPending = proposed.deletionPending;
@@ -1518,9 +1511,8 @@ export default class LLMvaultPlugin extends Plugin {
     }
     this.indexOllama.abortAll();
     this.index.cancel();
-    await (rebuild
-      ? this.index.rebuild({ digest, name: embeddingModel })
-      : this.index.start({ digest, name: embeddingModel }));
+    const model = { digest, name: embeddingModel, port: this.getSettings().ollamaPort };
+    await (rebuild ? this.index.rebuild(model) : this.index.start(model));
   }
 
   async rebuildIndex(): Promise<void> {
@@ -1531,17 +1523,13 @@ export default class LLMvaultPlugin extends Plugin {
     discovery: OllamaDiscovery,
     embeddingModel: string,
   ): Promise<void> {
-    if (this.deleteOperation) throw new Error("vault_chat_deletion_in_progress");
-    if (this.isDeletionIncomplete()) throw new Error("vault_chat_deletion_incomplete");
-    if (this.isStopped()) {
-      await this.updateData(() => ({ stopped: false }));
-    }
-    void this.startIndexing(discovery, embeddingModel);
+    await this.saveSettings({ ...this.getSettings(), embeddingModel }, discovery);
   }
 
   deleteAllData(): Promise<void> {
     if (this.deleteOperation) return this.deleteOperation;
     this.deletionBarrier = true;
+    this.configurationRevision += 1;
     this.index?.cancel();
     this.indexOllama.abortAll();
     this.abortAnswerRequests();
@@ -1636,16 +1624,19 @@ export default class LLMvaultPlugin extends Plugin {
 
   private async restoreIndex(rebuild = false): Promise<void> {
     if (this.isStopped()) return;
+    const revision = this.configurationRevision;
     const settings = this.getSettings();
     if (!settings.embeddingModel) return;
     try {
       const discovery = await this.discoverModels(settings.ollamaPort);
+      if (revision !== this.configurationRevision || this.isStopped()) return;
       if (discovery.embeddingModels.includes(settings.embeddingModel)) {
         await this.startIndexing(discovery, settings.embeddingModel, rebuild);
       } else {
         this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
       }
     } catch {
+      if (revision !== this.configurationRevision || this.isStopped()) return;
       this.reportIndex({ ...this.indexSnapshot, phase: "failed" });
     }
   }
