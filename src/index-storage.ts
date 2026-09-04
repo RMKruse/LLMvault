@@ -46,7 +46,7 @@ export interface StoredChunk {
   vector: string;
 }
 
-interface SourceRecord {
+export interface SourceRecord {
   chunks: StoredChunk[];
   fingerprint: string;
   sourceKey: string;

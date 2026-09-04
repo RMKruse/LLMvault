@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createContext, runInContext } from "node:vm";
+import { createIndexChecks } from "../evaluation/index-acceptance.mjs";
+import { groundedCase } from "../evaluation/grounded-acceptance.mjs";
+import { installRecoveryWatch, rendererExpression, rendererSetup } from "../evaluation/obsidian-acceptance.mjs";
 import { build } from "esbuild";
 import { executeAnswer } from "../src/answer.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "../src/quality.ts";
@@ -454,4 +458,126 @@ test("a canceled answer waiting behind a data write is not persisted", async () 
   await assert.rejects(save, { name: "AbortError" });
   assert.equal(writes, 0);
   assert.equal(plugin.getConversationState().conversations.length, 0);
+});
+
+
+test("serialized acceptance renderers use the current index contract without Ollama or Obsidian", { timeout: 5_000 }, async (t) => {
+  const plugin = await indexingPlugin();
+  const probePath = "2026.09.02.md", controlPath = "Linked.md";
+  const contents = new Map([[probePath, "# Acceptance probe\n\noriginal\n"], [controlPath, "Unrelated control"]]);
+  const { app } = plugin;
+  let rebuilding;
+  app.vault.getMarkdownFiles = () => [...contents.keys()].map((path) => ({ path }));
+  app.vault.getAbstractFileByPath = (path) => contents.has(path) ? { path } : null;
+  app.vault.cachedRead = async ({ path }) => contents.get(path);
+  app.vault.modify = async (file, content) => {
+    contents.set(file.path, content);
+    rebuilding = plugin.index.invalidate([file.path]);
+  };
+  app.metadataCache = {
+    getFileCache: () => ({ links: [{ link: controlPath }] }),
+    getFirstLinkpathDest: (path) => app.vault.getAbstractFileByPath(path),
+  };
+  plugin.vaultSources = () => app.vault.getMarkdownFiles().map((file) => ({
+    path: file.path, read: () => app.vault.cachedRead(file),
+  }));
+  plugin.indexOllama.embed = async (_port, _model, inputs) => inputs.map(() => [1]);
+  plugin.queryOllama.validatePinnedModel = async () => "compatible";
+  plugin.queryOllama.embed = async (_port, _model, inputs) => inputs.map(() => [1]);
+  plugin.revalidateEvidence = (evidence) => plugin.index.resolveEvidenceBatch(evidence);
+  plugin.discoverModels = async () => ({ ...discovery, modelDigests: { embed: "digest" } });
+  plugin.openVaultChat = async () => {};
+  await plugin.startIndexing(await plugin.discoverModels(), "embed");
+  assert.equal(plugin.getIndexSnapshot().phase, "ready");
+
+  // Bind public methods to the real instance, but reject renderer reads of private state.
+  const index = plugin.index;
+  plugin.index = new Proxy(index, {
+    get(target, key) {
+      assert.ok(!["active", "storage", "adapter"].includes(key), `private renderer access: ${String(key)}`);
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const button = { attributes: {}, focus() {}, setAttribute(key, value) { this.attributes[key] = value; }, getAttribute(key) { return this.attributes[key]; } };
+  let questionAsked = false, answerError;
+  const view = {
+    citationRegistry: new Map(), answering: false,
+    contentEl: { querySelector: () => button },
+    answerEl: { querySelectorAll: () => [] },
+    questionEl: { value: "", form: { requestSubmit() {
+      questionAsked = true;
+      view.answering = true;
+      void plugin.retrieve(view.questionEl.value).then((evidence) => {
+        view.citationRegistry = new Map(evidence.map((item) => [item.citationId, item]));
+      }).catch((error) => { answerError = error; }).finally(() => { view.answering = false; });
+    } } },
+  };
+  app.workspace = { onLayoutReady: (ready) => ready(), getLeavesOfType: () => [{ view }] };
+  app.plugins = { loadPlugin() {}, manifests: { llmvault: {} }, plugins: { llmvault: plugin } };
+  const timers = new Set();
+  const context = createContext({
+    app, TextEncoder, URL, performance, crypto: globalThis.crypto,
+    localStorage: { setItem() {} },
+    setTimeout: (...args) => { const timer = setTimeout(...args); timers.add(timer); return timer; },
+    clearTimeout,
+    setInterval: (...args) => { const timer = setInterval(...args); timers.add(timer); return timer; },
+    clearInterval,
+    fetch: async () => ({ json: async () => ({ models: [] }) }),
+  });
+  t.after(() => { for (const timer of timers) { clearTimeout(timer); clearInterval(timer); } });
+  const evaluate = (fn, ...args) => runInContext(rendererExpression(fn, ...args), context);
+  const raw = await evaluate(groundedCase, "Summarize yesterday.", false);
+  assert.ifError(answerError);
+  assert.equal(questionAsked, true);
+  assert.equal(raw.dailyTargetPass, true);
+  assert.deepEqual(Array.from(raw.expectedEvidence, ({ path, fingerprint }) => ({ path, fingerprint })),
+    Array.from(raw.evidence, ({ path, fingerprint }) => ({ path, fingerprint })));
+  assert.deepEqual(Array.from(raw.expectedEvidence, ({ path }) => path), [probePath, controlPath]);
+  assert.equal(raw.pathSelections.length, 1, "evidence inspection must not pollute question observations");
+  assert.equal(raw.queryEmbeddings, 0);
+
+  await evaluate(rendererSetup, { probePath, controlPath, controlToken: "Unrelated control", chatModel: "chat", embeddingModel: "embed" });
+  const harness = context.__llmvaultAcceptance;
+  const before = await harness.canonicalDigest();
+  const mutation = await harness.mutation("original", "replacement");
+  assert.ok(Number.isFinite(mutation.mutation.queryIneligibleMs));
+  assert.ok(Number.isFinite(mutation.mutation.replacementAfterEmbeddingMs));
+  assert.ok(mutation.ui.samples > 0);
+  await rebuilding;
+  const changed = await harness.canonicalDigest();
+  assert.notEqual(changed, before);
+  await plugin.rebuildIndex();
+  assert.equal(await harness.canonicalDigest(), changed, "digest ignores generation identity");
+  const failures = await harness.failures("recovered");
+  assert.ok(Object.values(failures).every(Boolean), JSON.stringify(failures));
+  await rebuilding;
+
+  const checks = createIndexChecks(plugin.index, app.vault.adapter, "plugin/index-v1");
+  const [current] = await checks.evidence([probePath]);
+  const expected = { oldPath: probePath, path: probePath, fingerprint: current.fingerprint, token: "recovered" };
+  await evaluate(installRecoveryWatch, expected);
+  assert.equal((await harness.validate(expected)).exposedInvalidContent, false);
+  await evaluate(installRecoveryWatch, { ...expected, fingerprint: "wrong" });
+  assert.equal((await harness.validate(expected)).exposedInvalidContent, true, "watch detects wrong evidence");
+
+  for (const boundary of ["record", "catalog", "pointer", "cleanup"]) {
+    const reached = deferred(), release = deferred();
+    const restore = checks.armCrash(boundary, async (event) => { reached.resolve(event); await release.promise; });
+    try {
+      const build = plugin.rebuildIndex();
+      const event = await reached.promise;
+      assert.equal(event.boundary, boundary);
+      assert.equal(event.method, boundary === "pointer" ? "process" : boundary === "cleanup" ? "rmdir" : "write");
+      if (boundary === "cleanup") assert.equal(await app.vault.adapter.exists(event.path), false);
+      else assert.ok(await app.vault.adapter.read(event.path), "hook follows the durable write");
+      release.resolve();
+      await build;
+      assert.equal(plugin.getIndexSnapshot().phase, "ready");
+    } finally { release.resolve(); restore(); }
+  }
+  const reached = deferred();
+  context.llmvaultBoundary = (payload) => reached.resolve(JSON.parse(payload));
+  await harness.armCrash("record", { kind: "modify", path: probePath, token: "crash" });
+  assert.equal((await reached.promise).boundary, "record", "actual renderer installs its hook on the vault adapter");
 });

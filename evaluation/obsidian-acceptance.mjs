@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { REFERENCE_CONFIGURATION } from "../src/retrieval-calibration.ts";
 import { PINNED_CHAT, PROMPT_SHA256, hash, evaluateRelease } from "./proof.mjs";
+import { createIndexChecks } from "./index-acceptance.mjs";
 import { QUESTIONS, groundedCase, summarizeGrounded } from "./grounded-acceptance.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -282,10 +283,10 @@ async function prepareWorkspace(source, chatModel, embeddingModel) {
   return { profile, temporary, vault };
 }
 
-async function rendererSetup(config) {
+export async function rendererSetup(config, indexChecks = createIndexChecks) {
   const waitFor = async (predicate, timeout = 120_000) => {
     const deadline = Date.now() + timeout;
-    while (!predicate()) {
+    while (!(await predicate())) {
       if (Date.now() >= deadline) throw new Error("acceptance renderer timeout");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -302,6 +303,7 @@ async function rendererSetup(config) {
   }
   const plugin = app.plugins.plugins.llmvault;
   if (!plugin) throw new Error("production plugin did not load");
+  const checks = indexChecks(plugin.index, app.vault.adapter, `${plugin.manifest.dir}/index-v1`);
   await plugin.saveSettings({ chatModel: config.chatModel, embeddingModel: config.embeddingModel, ollamaPort: 11434 });
   await new Promise((resolve) => app.workspace.onLayoutReady(resolve));
   await plugin.openVaultChat();
@@ -431,18 +433,16 @@ async function rendererSetup(config) {
     const resolved = await plugin.revalidateEvidence(evidence);
     return resolved.some((item) => item?.text.includes(token));
   };
-  const expectedIsExposed = (expected) => {
-    const entries = plugin.index.active?.catalog.entries ?? [];
-    const paths = new Set(entries.map(({ path }) => path));
-    const current = entries.find(({ path }) => path === expected.path);
-    return (expected.oldPath !== expected.path && paths.has(expected.oldPath)) ||
-      (Boolean(current) && current.fingerprint !== expected.fingerprint);
-  };
+  let recoveryInspection = Promise.resolve();
   if (config.recoveryExpected) {
+    let inspecting = false;
     const inspect = () => {
-      if (plugin.getIndexSnapshot().available && expectedIsExposed(config.recoveryExpected)) {
-        state.recoveryExposedInvalidContent = true;
-      }
+      if (!plugin.getIndexSnapshot().available || inspecting) return;
+      inspecting = true;
+      recoveryInspection = checks.exposed(config.recoveryExpected).then((exposed) => {
+        state.recoveryExposedInvalidContent ||= exposed;
+      }).catch(() => { state.recoveryExposedInvalidContent = true; })
+        .finally(() => { inspecting = false; });
     };
     inspect();
     plugin.subscribeIndex(inspect);
@@ -509,18 +509,15 @@ async function rendererSetup(config) {
       startUi("reconciliation");
       const started = performance.now();
       let activatedAt = 0;
-      const activationProbe = setInterval(() => {
-        if (plugin.index.active?.catalog.entries.some(({ path, fingerprint }) =>
-          path === config.probePath && fingerprint === expectedFingerprint)) {
-          activatedAt ||= performance.now();
-        }
-      }, 1);
       await app.vault.modify(file, replacement);
       await waitFor(() => state.lastInvalidatedAt >= started);
       const invalidatedAt = state.lastInvalidatedAt;
       const ineligible = await plugin.index.resolveEvidence(oldEvidence);
-      await waitFor(() => activatedAt > 0);
-      clearInterval(activationProbe);
+      await waitFor(async () => {
+        if (!(await checks.replacementAvailable(config.probePath, expectedFingerprint))) return false;
+        activatedAt = performance.now();
+        return true;
+      });
       await waitReady(started);
       const ui = await stopUi("reconciliation");
       if (ineligible) throw new Error("mutated source remained query eligible");
@@ -592,15 +589,14 @@ async function rendererSetup(config) {
       await app.vault.modify(file, `# Acceptance probe\n\n${nextToken}\n`);
       await waitReady(marker);
 
-      const adapter = plugin.index.adapter;
-      const activeBefore = await adapter.read(`${plugin.manifest.dir}/index-v1/active.json`);
+      const activeBefore = await checks.readPointer();
       const embed = plugin.indexOllama.embed;
       plugin.indexOllama.embed = async () => { throw new Error("forced fatal embedding failure"); };
       marker = performance.now();
       await app.vault.modify(file, `# Acceptance probe\n\nfatal-${nextToken}\n`);
       const fatal = await waitReady(marker);
       plugin.indexOllama.embed = embed;
-      const activeAfter = await adapter.read(`${plugin.manifest.dir}/index-v1/active.json`);
+      const activeAfter = await checks.readPointer();
       const fatalFailedSourceAbsent = !(await currentEvidence(`fatal-${nextToken}`, config.probePath));
       const fatalUnrelatedAvailable = await currentEvidence(config.controlToken, config.controlPath);
       const fatalGenerationIsolated = fatal.phase === "failed" && fatal.available &&
@@ -623,69 +619,45 @@ async function rendererSetup(config) {
       return plugin.getIndexSnapshot();
     },
     async armCrash(boundary, operation) {
-      const adapter = plugin.index.adapter;
-      const match = (method, target) =>
-        (boundary === "record" && method === "write" && target.includes("/records/")) ||
-        (boundary === "catalog" && method === "write" && target.endsWith("/catalog.json")) ||
-        (boundary === "pointer" && method === "process" && target.endsWith("/active.json")) ||
-        (boundary === "cleanup" && method === "rmdir" && target.includes("/generations/"));
-      for (const method of ["write", "process", "rmdir"]) {
-        const original = adapter[method].bind(adapter);
-        adapter[method] = async (...args) => {
-          const result = await original(...args);
-          if (match(method, args[0])) {
-            globalThis.llmvaultBoundary(JSON.stringify({ boundary, method, path: args[0] }));
-            await new Promise(() => {});
-          }
-          return result;
-        };
-      }
+      checks.armCrash(boundary, async (event) => {
+        globalThis.llmvaultBoundary(JSON.stringify(event));
+        await new Promise(() => {});
+      });
       const file = app.vault.getAbstractFileByPath(operation.path);
       if (operation.kind === "modify") await app.vault.modify(file, `# Acceptance probe\n\n${operation.token}\n`);
       if (operation.kind === "delete") await app.vault.delete(file);
       if (operation.kind === "rename") await app.fileManager.renameFile(file, operation.nextPath);
     },
     async validate(expected) {
-      const entries = plugin.index.active?.catalog.entries ?? [];
+      const entries = plugin.getIndexSnapshot().outcomes;
       const paths = new Set(entries.map(({ path }) => path));
       let invalid = paths.has(expected.oldPath) && expected.oldPath !== expected.path;
       if (expected.path) {
         invalid ||= !paths.has(expected.path);
-        invalid ||= entries.find(({ path }) => path === expected.path)?.fingerprint !== expected.fingerprint;
         const evidence = await plugin.retrieve(expected.token);
         const current = await plugin.revalidateEvidence(evidence.filter(({ path }) => path === expected.path));
-        invalid ||= !current.some((item) => item?.text.includes(expected.token));
+        invalid ||= !current.some((item) => item?.text.includes(expected.token) && item.fingerprint === expected.fingerprint);
         invalid ||= Boolean(expected.oldToken) && current.some((item) => item?.text.includes(expected.oldToken));
       } else {
         invalid ||= paths.has(expected.oldPath);
       }
-      const earlyExposure = Boolean(globalThis.__llmvaultRecoveryExposedInvalidContent);
       clearInterval(globalThis.__llmvaultRecoveryTimer);
+      await globalThis.__llmvaultRecoveryInspection;
+      await recoveryInspection;
+      const earlyExposure = Boolean(globalThis.__llmvaultRecoveryExposedInvalidContent);
       return {
         converged: plugin.getIndexSnapshot().phase === "ready",
         exposedInvalidContent: invalid || state.recoveryExposedInvalidContent || earlyExposure,
       };
     },
-    async canonicalDigest() {
-      const active = plugin.index.active;
-      if (!active) return "";
-      const payload = {
-        entries: active.catalog.entries.map(({ record, ...entry }) => ({ ...entry, record: record?.split("/").at(-1) }))
-          .sort((left, right) => left.path.localeCompare(right.path)),
-        records: [...active.records].sort(([left], [right]) => left.localeCompare(right)),
-        signature: active.catalog.signature,
-      };
-      const bytes = new globalThis.TextEncoder().encode(JSON.stringify(payload));
-      const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    },
+    canonicalDigest: () => checks.canonicalDigest(),
   };
   config.discovery = await plugin.discoverModels(11434);
   return config.discovery;
 }
 
 async function setupInstance(instance, config) {
-  const discovery = await instance.cdp.evaluateFunction(rendererSetup, config);
+  const discovery = await instance.cdp.evaluate(rendererExpression(rendererSetup, config));
   config.discovery = discovery;
   return discovery;
 }
@@ -740,21 +712,28 @@ async function waitForCleanup(indexRoot) {
   throw new Error("index cleanup did not settle within 60 seconds");
 }
 
-function installRecoveryWatch(expected) {
+export function installRecoveryWatch(expected, indexChecks = createIndexChecks) {
   globalThis.__llmvaultRecoveryExposedInvalidContent = false;
+  globalThis.__llmvaultRecoveryInspection = Promise.resolve();
+  let inspecting = false;
   const inspect = () => {
-    const plugin = globalThis.app?.plugins?.plugins?.llmvault;
-    if (!plugin?.getIndexSnapshot().available) return;
-    const entries = plugin.index.active?.catalog.entries ?? [];
-    const paths = new Set(entries.map(({ path }) => path));
-    const current = entries.find(({ path }) => path === expected.path);
-    if ((expected.oldPath !== expected.path && paths.has(expected.oldPath)) ||
-      (current && current.fingerprint !== expected.fingerprint)) {
-      globalThis.__llmvaultRecoveryExposedInvalidContent = true;
-    }
+    const app = globalThis.app;
+    const plugin = app?.plugins?.plugins?.llmvault;
+    if (!plugin?.getIndexSnapshot().available || inspecting) return;
+    inspecting = true;
+    const checks = indexChecks(plugin.index, app.vault.adapter, `${plugin.manifest.dir}/index-v1`);
+    globalThis.__llmvaultRecoveryInspection = checks.exposed(expected).then((exposed) => {
+      globalThis.__llmvaultRecoveryExposedInvalidContent ||= exposed;
+    }).catch(() => { globalThis.__llmvaultRecoveryExposedInvalidContent = true; })
+      .finally(() => { inspecting = false; });
   };
   inspect();
   globalThis.__llmvaultRecoveryTimer = setInterval(inspect, 1);
+}
+
+// CDP drops module scope. Serialize the checked contract alongside each renderer entry point.
+export function rendererExpression(fn, ...args) {
+  return `(${fn})(...${JSON.stringify(args)}, ${createIndexChecks})`;
 }
 
 async function crashRecovery(instance, executable, workspace, config, boundary, operation, expected) {
@@ -766,7 +745,7 @@ async function crashRecovery(instance, executable, workspace, config, boundary, 
   await stopObsidian(instance, "SIGKILL");
   const started = performance.now();
   const restarted = await launchObsidian(executable, workspace.profile);
-  await restarted.cdp.evaluateFunction(installRecoveryWatch, expected);
+  await restarted.cdp.evaluate(rendererExpression(installRecoveryWatch, expected));
   await setupInstance(restarted, { ...config, recoveryExpected: expected });
   await restarted.cdp.evaluate("__llmvaultAcceptance.waitUntilReady()");
   const pluginMs = performance.now() - started;
@@ -902,7 +881,7 @@ export async function runHarness(evaluateAcceptance) {
           await instance.cdp.evaluate("app.plugins.unloadPlugin('llmvault')");
           await setupInstance(instance, config);
           await instance.cdp.evaluate("__llmvaultAcceptance.waitUntilReady()");
-          const raw = await instance.cdp.evaluateFunction(groundedCase, QUESTIONS[id === "daily" ? "daily" : "direct"], id === "direct-history");
+          const raw = await instance.cdp.evaluate(rendererExpression(groundedCase, QUESTIONS[id === "daily" ? "daily" : "direct"], id === "direct-history"));
           const { item, review } = summarizeGrounded(raw, report.groundedAnswer.configuration, id, run);
           report.groundedAnswer.cases.push(item);
           reviews.push(review);

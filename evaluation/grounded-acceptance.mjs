@@ -1,3 +1,4 @@
+import { createIndexChecks } from "./index-acceptance.mjs";
 import { conversationUserMessage } from "../src/conversations.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "../src/quality.ts";
 import { hash, observeRequest, retrievalIdentity, same, supportBinding } from "./proof.mjs";
@@ -9,7 +10,7 @@ export const QUESTIONS = {
 
 // Executed inside disposable Obsidian. Only the clock and proof sampling are fixed;
 // the production view still validates, retrieves, assembles, streams and saves the turn.
-export async function groundedCase(question, history) {
+export async function groundedCase(question, history, indexChecks = createIndexChecks) {
   const app = globalThis.app;
   const plugin = app.plugins.plugins.llmvault;
   const view = app.workspace.getLeavesOfType("vault-chat-view")[0].view;
@@ -24,12 +25,8 @@ export async function groundedCase(question, history) {
     ...(app.metadataCache.getFileCache(dailyFile)?.links ?? [])
       .map(({ link }) => app.metadataCache.getFirstLinkpathDest(link, dailyFile.path)?.path).filter(Boolean),
   ])] : [];
-  const expectedEvidence = expectedPaths.flatMap((sourcePath) => {
-    const entry = plugin.index.active?.catalog.entries.find(({ path }) => path === sourcePath);
-    const record = plugin.index.active?.records.get(entry?.record);
-    const chunk = entry?.status === "indexed" ? record?.chunks[0] : null;
-    return chunk ? [{ ...chunk.locator, fingerprint: entry.fingerprint }] : [];
-  }).slice(0, 4);
+  const checks = indexChecks(plugin.index, app.vault.adapter, `${plugin.manifest.dir}/index-v1`);
+  const expectedEvidence = await checks.evidence(expectedPaths);
   const retrieve = plugin.retrieve.bind(plugin);
   plugin.retrieve = async (...args) => {
     const evidence = await retrieve(...args);

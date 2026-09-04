@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "allowJs": false,
+    "allowJs": true,
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -17,5 +17,5 @@
     "target": "ES2022",
     "types": ["obsidian"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "evaluation/index-acceptance.mjs"]
 }
