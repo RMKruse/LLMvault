@@ -54,18 +54,19 @@ async function availablePort() {
   return port;
 }
 
-class Cdp {
+export class Cdp {
   constructor(socket) {
     this.socket = socket;
     this.id = 0;
     this.pending = new Map();
     this.listeners = new Map();
+    socket.addEventListener("close", () => this.fail(new Error("Obsidian CDP socket closed")));
+    socket.addEventListener("error", () => this.fail(new Error("Obsidian CDP socket error")));
     socket.addEventListener("message", ({ data }) => {
       const message = JSON.parse(data);
       if (message.id) {
         const pending = this.pending.get(message.id);
         if (!pending) return;
-        this.pending.delete(message.id);
         pending.resolve(message.error ? { error: message.error.message } : { value: message.result });
         return;
       }
@@ -73,37 +74,95 @@ class Cdp {
     });
   }
 
-  static async connect(port, child) {
-    const deadline = Date.now() + 30_000;
+  static async connect(port, child, timeoutMs = 30_000) {
+    const controller = new globalThis.AbortController();
+    const { signal } = controller;
+    const timer = setTimeout(() => controller.abort(new Error("Obsidian CDP connection timed out")), timeoutMs);
+    const onError = (error) => controller.abort(error);
+    const onExit = (code, signal) => onError(new Error(`Obsidian exited before CDP was ready (${signal ?? code})`));
+    child.once("error", onError);
+    child.once("exit", onExit);
     let lastError;
-    while (Date.now() < deadline) {
-      if (child.exitCode !== null) throw new Error(`Obsidian exited before CDP was ready (${child.exitCode})`);
-      try {
-        const pages = await globalThis.fetch(`http://127.0.0.1:${port}/json/list`).then((response) => response.json());
-        const page = pages.find(({ type }) => type === "page");
-        if (page) {
-          const socket = new globalThis.WebSocket(page.webSocketDebuggerUrl);
-          await new Promise((resolve, reject) => {
-            socket.addEventListener("open", resolve, { once: true });
-            socket.addEventListener("error", reject, { once: true });
-          });
-          return new Cdp(socket);
+    try {
+      if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode);
+      while (!signal.aborted) {
+        let socket;
+        try {
+          const pages = await globalThis.fetch(`http://127.0.0.1:${port}/json/list`, { signal }).then((response) => response.json());
+          const page = pages.find(({ type }) => type === "page");
+          if (page) {
+            socket = new globalThis.WebSocket(page.webSocketDebuggerUrl);
+            const cdp = new Cdp(socket);
+            let onOpen, onFailure, onAbort;
+            try {
+              await new Promise((resolve, reject) => {
+                onOpen = resolve;
+                onFailure = () => reject(cdp.failure ?? new Error("Obsidian CDP connection failed"));
+                onAbort = () => reject(signal.reason);
+                socket.addEventListener("open", onOpen, { once: true });
+                socket.addEventListener("error", onFailure, { once: true });
+                socket.addEventListener("close", onFailure, { once: true });
+                signal.addEventListener("abort", onAbort, { once: true });
+                if (signal.aborted) onAbort();
+              });
+              signal.throwIfAborted();
+              if (cdp.failure) throw cdp.failure;
+              return cdp;
+            } finally {
+              socket.removeEventListener("open", onOpen);
+              socket.removeEventListener("error", onFailure);
+              socket.removeEventListener("close", onFailure);
+              signal.removeEventListener("abort", onAbort);
+            }
+          }
+        } catch (error) {
+          socket?.close();
+          lastError = error;
         }
-      } catch (error) {
-        lastError = error;
+        await delay(100, undefined, { signal });
       }
-      await delay(100);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        await new Promise((resolve) => {
+          child.once("exit", resolve);
+          child.kill("SIGKILL");
+        });
+      }
+      throw new Error(`Obsidian CDP did not start: ${String(signal.reason ?? lastError ?? error)}`);
+    } finally {
+      clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
     }
-    throw new Error(`Obsidian CDP did not start: ${String(lastError ?? "timeout")}`);
   }
 
-  async call(method, params = {}) {
+  fail(error) {
+    this.failure ??= error;
+    for (const pending of this.pending.values()) pending.reject(this.failure);
+    this.pending.clear();
+    for (const listeners of this.listeners.values()) {
+      for (const listener of listeners) listener.reject(this.failure);
+    }
+    this.listeners.clear();
+  }
+
+  async call(method, params = {}, timeoutMs = 600_000) {
+    if (this.failure) throw this.failure;
     const id = ++this.id;
-    const promise = new Promise((resolve, reject) => this.pending.set(id, { reject, resolve }));
-    this.socket.send(JSON.stringify({ id, method, params }));
-    const response = await promise;
-    if (response.error) throw new Error(response.error);
-    return response.value;
+    let timer;
+    try {
+      const response = await new Promise((resolve, reject) => {
+        this.pending.set(id, { reject, resolve });
+        timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`)), timeoutMs);
+        this.socket.send(JSON.stringify({ id, method, params }));
+      });
+      if (response.error) throw new Error(response.error);
+      return response.value;
+    } finally {
+      clearTimeout(timer);
+      this.pending.delete(id);
+    }
   }
 
   async evaluate(expression) {
@@ -121,6 +180,7 @@ class Cdp {
 
   once(method, timeoutMs = 120_000) {
     return new Promise((resolve, reject) => {
+      if (this.failure) { reject(this.failure); return; }
       const listeners = this.listeners.get(method) ?? new Set();
       const timer = setTimeout(() => {
         listeners.delete(listener);
@@ -131,12 +191,18 @@ class Cdp {
         listeners.delete(listener);
         resolve(params);
       };
+      listener.reject = (error) => {
+        clearTimeout(timer);
+        listeners.delete(listener);
+        reject(error);
+      };
       listeners.add(listener);
       this.listeners.set(method, listeners);
     });
   }
 
   close() {
+    this.fail(new Error("Obsidian CDP socket closed"));
     this.socket.close();
   }
 }

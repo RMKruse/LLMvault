@@ -1,7 +1,91 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import process from "node:process";
 import test from "node:test";
 
 import { evaluateAcceptance } from "../evaluation/acceptance.mjs";
+import { Cdp } from "../evaluation/obsidian-acceptance.mjs";
+
+test("CDP disconnect rejects every pending evaluation and event wait", { timeout: 1_000 }, async () => {
+  for (const event of ["close", "error", "explicit close"]) {
+    const socket = new globalThis.EventTarget();
+    socket.send = () => {};
+    socket.close = () => {};
+    const cdp = new Cdp(socket);
+    const rejected = [cdp.evaluate("never()"), cdp.call("Runtime.enable"), cdp.once("Runtime.bindingCalled")]
+      .map((promise) => assert.rejects(promise, /CDP socket (closed|error)/));
+    if (event === "explicit close") cdp.close();
+    else socket.dispatchEvent(new globalThis.Event(event));
+    await Promise.all(rejected);
+    assert.equal(cdp.pending.size, 0);
+    assert.equal(cdp.listeners.size, 0);
+    await assert.rejects(cdp.call("Runtime.enable"), /CDP socket/);
+    await assert.rejects(cdp.once("Runtime.bindingCalled"), /CDP socket/);
+  }
+});
+
+test("CDP deadlines and send failures release requests without poisoning later replies", { timeout: 1_000 }, async () => {
+  const socket = new globalThis.EventTarget();
+  const sent = [];
+  socket.send = (data) => sent.push(JSON.parse(data));
+  const reply = (message) => socket.dispatchEvent(new globalThis.MessageEvent("message", { data: JSON.stringify(message) }));
+  const cdp = new Cdp(socket);
+  await assert.rejects(cdp.call("Runtime.evaluate", {}, 10), /Runtime.evaluate timed out after 10ms/);
+  assert.equal(cdp.pending.size, 0);
+  reply({ id: sent[0].id, result: "late" });
+  const success = cdp.call("Runtime.enable");
+  reply({ id: sent.at(-1).id, result: { enabled: true } });
+  assert.deepEqual(await success, { enabled: true });
+  const failure = assert.rejects(cdp.call("Unknown.method"), /unknown method/);
+  reply({ id: sent.at(-1).id, error: { message: "unknown method" } });
+  await failure;
+  socket.send = () => { throw new Error("send failed"); };
+  await assert.rejects(cdp.call("Runtime.enable"), /send failed/);
+  assert.equal(cdp.pending.size, 0);
+});
+
+test("CDP acquisition deadlines kill and reap the child even when HTTP or WebSocket stalls", { timeout: 5_000 }, async () => {
+  for (const phase of ["HTTP", "body", "WebSocket"]) {
+    const sockets = new Set();
+    let reached = false;
+    const server = createServer((request, response) => {
+      if (phase === "HTTP") { reached = true; return; }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      if (phase === "body") { reached = true; response.write("["); return; }
+      response.end(JSON.stringify([{ type: "page", webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools` }]));
+    });
+    server.on("upgrade", () => { reached = true; });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      await once(child, "spawn");
+      await assert.rejects(Cdp.connect(server.address().port, child, 200), /CDP.*timed out/);
+      assert.equal(reached, true, `${phase} acquisition reached its blocking operation`);
+      assert.equal(child.signalCode, "SIGKILL");
+      assert.equal(child.listenerCount("error"), 0);
+      assert.equal(child.listenerCount("exit"), 0);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+});
+
+test("CDP acquisition handles spawn errors and already exited children", { timeout: 1_000 }, async () => {
+  const missing = spawn("/nonexistent/llmvault-obsidian", [], { stdio: "ignore" });
+  await assert.rejects(Cdp.connect(0, missing), /ENOENT/);
+  const exited = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(exited, "exit");
+  await assert.rejects(Cdp.connect(0, exited), /exited before CDP was ready/);
+});
 
 const run = () => ({
   accounting: { complete: true, discovered: 1_200, statuses: { indexed: 1_000, unsupported_format: 200 }, terminal: 1_200 },
