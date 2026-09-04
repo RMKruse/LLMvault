@@ -62,13 +62,18 @@ export interface VaultSource {
   reason?: string;
 }
 
-export type SourceEntry = SourceOutcome & {
-  chunkCount?: number;
-  fingerprint: string | null;
-  record?: string;
+export type PreparedEntry = SourceOutcome & {
   sourceKey: string;
-  vectorCount?: number;
-};
+} & ({
+  fingerprint: string;
+  status: "indexed";
+} | {
+  chunkCount?: never;
+  fingerprint: string | null;
+  record?: never;
+  status: Exclude<TerminalStatus, "indexed">;
+  vectorCount?: never;
+});
 
 export type PreparedChunk =
   | (MarkdownChunk & { format: "markdown" })
@@ -80,7 +85,7 @@ export type StoredLocator =
 
 export interface PreparedSource {
   chunks: PreparedChunk[];
-  entry: SourceEntry;
+  entry: PreparedEntry;
 }
 
 interface MarkdownPiece {
@@ -564,13 +569,13 @@ export async function prepareSource(source: VaultSource): Promise<PreparedSource
   }
 }
 
-export function statusCounts(entries: SourceEntry[]): Partial<Record<TerminalStatus, number>> {
+export function statusCounts(entries: SourceOutcome[]): Partial<Record<TerminalStatus, number>> {
   const counts: Partial<Record<TerminalStatus, number>> = {};
   for (const entry of entries) counts[entry.status] = (counts[entry.status] ?? 0) + 1;
   return counts;
 }
 
-export function outcomes(entries: SourceEntry[]): SourceOutcome[] {
+export function outcomes(entries: SourceOutcome[]): SourceOutcome[] {
   return entries.map((entry) => entry.status === "limit_exceeded"
     ? {
         ceiling: entry.ceiling,
@@ -586,12 +591,12 @@ export function outcomes(entries: SourceEntry[]): SourceOutcome[] {
       });
 }
 
-export function exactSourceMatch(left: SourceEntry, right: SourceEntry): boolean {
+export function exactSourceMatch(left: PreparedEntry, right: PreparedEntry): boolean {
   return left.fingerprint === right.fingerprint && left.sourceKey === right.sourceKey &&
     left.status === right.status;
 }
 
-export function matchesPreparedSource(prepared: PreparedSource, entry: SourceEntry & { chunks: { locator: StoredLocator }[] }): boolean {
+export function matchesPreparedSource(prepared: PreparedSource, entry: PreparedEntry & { chunks: { locator: StoredLocator }[] }): boolean {
   return exactSourceMatch(prepared.entry, entry) &&
     (entry.status !== "indexed" || (entry.chunks.length === prepared.chunks.length &&
       entry.chunks.every((chunk, ordinal) => {

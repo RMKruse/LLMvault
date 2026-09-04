@@ -17,5 +17,5 @@
     "target": "ES2022",
     "types": ["obsidian"]
   },
-  "include": ["src/**/*.ts", "evaluation/index-acceptance.mjs"]
+  "include": ["src/**/*.ts", "test/**/*.types.ts", "evaluation/index-acceptance.mjs"]
 }

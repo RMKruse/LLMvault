@@ -1,7 +1,7 @@
 import { minimumScoreFor } from "./quality.ts";
 import {
   exactSourceMatch, locatorFor, prepareSource, sameLocator,
-  type PreparedSource, type SourceEntry, type StoredLocator, type VaultSource,
+  type PreparedEntry, type PreparedSource, type StoredLocator, type VaultSource,
 } from "./index-source.ts";
 import type { ValidatedGeneration } from "./index-storage.ts";
 
@@ -64,7 +64,7 @@ export function resolveDailyRecapRequest(
 interface Candidate {
   citationId?: string;
   chunk: { id: string; locator: StoredLocator };
-  entry: SourceEntry;
+  entry: PreparedEntry;
   score: number;
 }
 
@@ -136,7 +136,7 @@ export async function hydrateCandidates(
 }
 
 function hydrate(
-  entry: SourceEntry,
+  entry: PreparedEntry,
   stored: { id: string; locator: StoredLocator },
   score: number,
   prepared: PreparedSource,

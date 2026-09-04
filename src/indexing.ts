@@ -1,10 +1,10 @@
 import {
   isStoredLocator, locatorFor, matchesPreparedSource, outcomes, prepareSource, statusCounts,
-  type SourceEntry, type SourceOutcome, type TerminalStatus, type VaultSource,
+  type SourceOutcome, type TerminalStatus, type VaultSource,
 } from "./index-source.ts";
 import {
   GenerationStorage, compatibleSignature, encodeVector, signatureFor, validModel,
-  type Catalog, type EmbeddingModel, type IndexAdapter, type IndexSignature,
+  type Catalog, type CatalogEntry, type EmbeddingModel, type IndexAdapter, type IndexSignature,
   type RuntimeEntry, type StoredChunk, type ValidatedGeneration,
 } from "./index-storage.ts";
 import {
@@ -377,7 +377,7 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
   ): Promise<IndexSnapshot> {
     const generationId = globalThis.crypto.randomUUID();
     await this.storage.create(generationId);
-    const entries: SourceEntry[] = [];
+    const entries: CatalogEntry[] = [];
     const statuses: IndexSnapshot["statuses"] = {};
     let catalogCommitted = false;
     const reusable = compatibleSignature(this.active?.signature, model)
@@ -398,9 +398,9 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
         const previous = reusable.get(entry.path);
         const reused = previous !== undefined && matchesPreparedSource(prepared, previous);
         if (reused && entry.status === "indexed") {
-          await this.storage.writeRecord(generationId, entry, previous.chunks.map((chunk) => ({
+          entries.push(await this.storage.writeRecord(generationId, entry, previous.chunks.map((chunk) => ({
             ...chunk, vector: encodeVector(chunk.vector),
-          })), vectorDimension);
+          })), vectorDimension));
         }
         if (!reused && entry.status === "indexed") {
           const storedChunks: StoredChunk[] = [];
@@ -426,9 +426,9 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
               });
             }
           }
-          await this.storage.writeRecord(generationId, entry, storedChunks, vectorDimension);
+          entries.push(await this.storage.writeRecord(generationId, entry, storedChunks, vectorDimension));
         }
-        entries.push(entry);
+        if (entry.status !== "indexed") entries.push(entry);
         statuses[entry.status] = (statuses[entry.status] ?? 0) + 1;
         const completed = entries.length;
         this.update({

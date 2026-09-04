@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TextEncoder } from "node:util";
 import { normalizeConversationState } from "../src/conversations.ts";
+import { locatorFor, prepareSource } from "../src/index-source.ts";
+import { GenerationStorage } from "../src/index-storage.ts";
 
 import {
   CHUNK_OVERLAP_BYTES,
@@ -68,6 +70,64 @@ class MemoryAdapter {
 
 const generationFolders = (adapter) =>
   [...adapter.folders].filter((path) => path.match(/\/generations\/[^/]+$/));
+
+test("record writes return completed metadata without mutating the prepared entry, including on failure", async (t) => {
+  const adapter = new MemoryAdapter();
+  const storage = new GenerationStorage(adapter, "plugin/index-v1");
+  const generation = crypto.randomUUID();
+  const { entry, chunks } = await prepareSource({ path: "Note.md", read: async () => "A fact" });
+  const original = structuredClone(entry);
+  const storedChunks = chunks.map((chunk, ordinal) => ({
+    id: `${entry.sourceKey}:${entry.fingerprint}:${ordinal}`,
+    locator: locatorFor(entry.path, chunk),
+    vector: encodeVector([1]),
+  }));
+  const failure = new Error("record write failed");
+  const write = t.mock.method(adapter, "write", async () => { throw failure; });
+  await assert.rejects(storage.writeRecord(generation, entry, storedChunks, 1), failure);
+  assert.deepEqual(entry, original);
+
+  write.mock.restore();
+  const persisted = await storage.writeRecord(generation, entry, storedChunks, 1);
+  assert.notEqual(persisted, entry);
+  assert.deepEqual(entry, original);
+  assert.deepEqual(persisted, {
+    ...original, chunkCount: chunks.length, vectorCount: chunks.length,
+    record: `records/${entry.sourceKey}-${entry.fingerprint}.json`,
+  });
+  assert.deepEqual(JSON.parse(await adapter.read(`plugin/index-v1/generations/${generation}/${persisted.record}`)), {
+    chunks: storedChunks, fingerprint: entry.fingerprint, sourceKey: entry.sourceKey, vectorDimension: 1,
+  });
+});
+
+test("catalog parsing rejects incomplete indexed entries and metadata on non-indexed outcomes", async () => {
+  const adapter = new MemoryAdapter();
+  const root = "plugin/index-v1";
+  const model = { name: "embed", digest: "digest" };
+  const index = new VaultIndex(adapter, root,
+    () => [{ path: "Note.md", read: async () => "A fact" }],
+    async (inputs) => inputs.map(() => [1]),
+  );
+  const ready = await index.start(model);
+  assert.equal(ready.phase, "ready");
+  const storage = new GenerationStorage(adapter, root);
+  const path = `${root}/generations/${ready.generationId}/catalog.json`;
+  const catalog = JSON.parse(await adapter.read(path));
+  assert.ok(await storage.restore(model));
+  for (const patch of [
+    { fingerprint: null }, { fingerprint: undefined },
+    { record: undefined }, { chunkCount: undefined }, { vectorCount: undefined },
+    { record: "records/other.json" }, { chunkCount: 0, vectorCount: 0 },
+    { chunkCount: 1.5, vectorCount: 1.5 }, { vectorCount: 2 },
+    ...["record", "chunkCount", "vectorCount"].map((key) => ({
+      status: "no_extractable_text", record: undefined, chunkCount: undefined, vectorCount: undefined,
+      [key]: catalog.entries[0][key],
+    })),
+  ]) {
+    await adapter.write(path, JSON.stringify({ ...catalog, entries: [{ ...catalog.entries[0], ...patch }] }));
+    assert.equal(await storage.restore(model), null, JSON.stringify(patch));
+  }
+});
 
 test("deferred progress outcomes and counters retain their publication state", async () => {
   const progress = [];

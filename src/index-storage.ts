@@ -1,6 +1,6 @@
 import {
   CHUNK_OVERLAP_BYTES, CHUNK_TARGET_BYTES, isRecord, isStoredLocator,
-  type SourceEntry, type StoredLocator,
+  type PreparedEntry, type StoredLocator,
 } from "./index-source.ts";
 
 const SCHEMA_VERSION = 1;
@@ -33,9 +33,17 @@ export interface IndexSignature {
   vectorDimension: number;
 }
 
+export type IndexedCatalogEntry = Extract<PreparedEntry, { status: "indexed" }> & {
+  chunkCount: number;
+  record: string;
+  vectorCount: number;
+};
+
+export type CatalogEntry = IndexedCatalogEntry | Exclude<PreparedEntry, { status: "indexed" }>;
+
 export interface Catalog {
   complete: true;
-  entries: SourceEntry[];
+  entries: CatalogEntry[];
   generationId: string;
   signature: IndexSignature;
 }
@@ -60,7 +68,7 @@ export interface RuntimeChunk {
   vector: Float32Array;
 }
 
-export type RuntimeEntry = SourceEntry & { chunks: RuntimeChunk[] };
+export type RuntimeEntry = CatalogEntry & { chunks: RuntimeChunk[] };
 
 export interface ValidatedGeneration {
   entries: RuntimeEntry[];
@@ -131,19 +139,42 @@ function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed) || parsed.complete !== true || !isGenerationId(parsed.generationId) ||
       !compatibleSignature(parsed.signature, model) || !Array.isArray(parsed.entries)) return null;
-    const entries: SourceEntry[] = [];
+    const entries: CatalogEntry[] = [];
     for (const item of parsed.entries) {
-      const status = String(isRecord(item) ? item.status : "");
       if (!isRecord(item) || typeof item.path !== "string" || typeof item.sourceKey !== "string" ||
         !(typeof item.fingerprint === "string" || item.fingerprint === null) ||
-        !["indexed", "no_extractable_text", "ignored_non_content", "unsupported_format",
-          "unrecognized_format", "limit_exceeded", "extractor_failed"].includes(status) ||
-        (status === "limit_exceeded"
-          ? !["raw_bytes", "extracted_text_bytes", "preprocessing_ms"].includes(String(item.limit)) ||
-            !Number.isFinite(item.observed) || !Number.isFinite(item.ceiling) ||
-            Number(item.ceiling) <= 0 || Number(item.observed) < Number(item.ceiling)
-          : item.reason !== undefined && typeof item.reason !== "string")) return null;
-      entries.push(item as unknown as SourceEntry);
+        (item.reason !== undefined && typeof item.reason !== "string")) return null;
+      const identity = { path: item.path, sourceKey: item.sourceKey, fingerprint: item.fingerprint };
+      if (item.status === "indexed") {
+        if (typeof item.fingerprint !== "string" || typeof item.record !== "string" ||
+          item.record !== `records/${item.sourceKey}-${item.fingerprint}.json` ||
+          typeof item.chunkCount !== "number" || !Number.isInteger(item.chunkCount) || item.chunkCount <= 0 ||
+          item.vectorCount !== item.chunkCount) return null;
+        entries.push({
+          ...identity, status: "indexed", fingerprint: item.fingerprint, reason: item.reason,
+          record: item.record, chunkCount: item.chunkCount, vectorCount: item.vectorCount,
+        });
+        continue;
+      }
+      if (item.record !== undefined || item.chunkCount !== undefined || item.vectorCount !== undefined) return null;
+      switch (item.status) {
+        case "limit_exceeded":
+          if ((item.limit !== "raw_bytes" && item.limit !== "extracted_text_bytes" && item.limit !== "preprocessing_ms") ||
+            typeof item.observed !== "number" || !Number.isFinite(item.observed) ||
+            typeof item.ceiling !== "number" || !Number.isFinite(item.ceiling) ||
+            item.ceiling <= 0 || item.observed < item.ceiling) return null;
+          entries.push({ ...identity, status: item.status, limit: item.limit, observed: item.observed, ceiling: item.ceiling });
+          break;
+        case "no_extractable_text":
+        case "ignored_non_content":
+        case "unsupported_format":
+        case "unrecognized_format":
+        case "extractor_failed":
+          entries.push({ ...identity, status: item.status, reason: item.reason });
+          break;
+        default:
+          return null;
+      }
     }
     return { complete: true, entries, generationId: parsed.generationId, signature: parsed.signature };
   } catch {
@@ -151,7 +182,7 @@ function parseCatalog(value: string, model: EmbeddingModel): Catalog | null {
   }
 }
 
-function parseRecord(value: string, entry: SourceEntry, dimension: number): RuntimeChunk[] {
+function parseRecord(value: string, entry: IndexedCatalogEntry, dimension: number): RuntimeChunk[] {
   const parsed: unknown = JSON.parse(value);
   if (!isRecord(parsed) || parsed.sourceKey !== entry.sourceKey || parsed.fingerprint !== entry.fingerprint ||
     parsed.vectorDimension !== dimension || !Array.isArray(parsed.chunks) || parsed.chunks.length === 0 ||
@@ -204,13 +235,8 @@ export class GenerationStorage {
         if (paths.has(entry.path)) return null;
         paths.add(entry.path);
         let chunks: RuntimeChunk[] = [];
-        if (entry.status !== "indexed") {
-          if (entry.record !== undefined || entry.chunkCount !== undefined || entry.vectorCount !== undefined) return null;
-        } else {
-          const recordName = `records/${entry.sourceKey}-${entry.fingerprint}.json`;
-          if (entry.record !== recordName || !Number.isInteger(entry.chunkCount) ||
-            entry.chunkCount !== entry.vectorCount) return null;
-          chunks = parseRecord(await this.adapter.read(`${generation}/${recordName}`), entry, catalog.signature.vectorDimension);
+        if (entry.status === "indexed") {
+          chunks = parseRecord(await this.adapter.read(`${generation}/${entry.record}`), entry, catalog.signature.vectorDimension);
         }
         entries.push({ ...entry, chunks });
       }
@@ -231,13 +257,16 @@ export class GenerationStorage {
     }
   }
 
-  async writeRecord(generationId: string, entry: SourceEntry, chunks: StoredChunk[], vectorDimension: number): Promise<void> {
+  async writeRecord(
+    generationId: string,
+    entry: Extract<PreparedEntry, { status: "indexed" }>,
+    chunks: StoredChunk[],
+    vectorDimension: number,
+  ): Promise<IndexedCatalogEntry> {
     const recordName = `records/${entry.sourceKey}-${entry.fingerprint}.json`;
-    const record: SourceRecord = { chunks, fingerprint: entry.fingerprint ?? "", sourceKey: entry.sourceKey, vectorDimension };
-    entry.chunkCount = chunks.length;
-    entry.record = recordName;
-    entry.vectorCount = chunks.length;
+    const record: SourceRecord = { chunks, fingerprint: entry.fingerprint, sourceKey: entry.sourceKey, vectorDimension };
     await this.adapter.write(`${this.root}/generations/${generationId}/${recordName}`, JSON.stringify(record));
+    return { ...entry, chunkCount: chunks.length, record: recordName, vectorCount: chunks.length };
   }
 
   async writeCatalog(catalog: Catalog): Promise<void> {
