@@ -628,26 +628,72 @@ test("a failed replacement keeps partial and prior stale chunks unqueryable", as
   assert.equal([...adapter.files.values()].some((value) => value.includes("replacement")), false);
 });
 
-test("queries scan the validated in-memory generation without record I/O", async () => {
+test("build and restore read each record once; retrieval uses the decoded generation", async (t) => {
   const adapter = new class extends MemoryAdapter {
-    recordReads = 0;
+    recordReads = new Map();
 
     async read(path) {
-      if (path.includes("/records/")) this.recordReads += 1;
+      if (path.includes("/records/")) {
+        this.recordReads.set(path, (this.recordReads.get(path) ?? 0) + 1);
+      }
       return await super.read(path);
     }
   }();
-  const index = new VaultIndex(
+  let decodes = 0;
+  const atob = globalThis.atob;
+  t.mock.method(globalThis, "atob", (value) => {
+    decodes += 1;
+    return atob(value);
+  });
+  let embeddings = 0;
+  const makeIndex = () => new VaultIndex(
     adapter,
     "plugin/index-v1",
-    () => [{ path: "Note.md", read: async () => "current" }],
-    async (inputs) => inputs.map(() => [1]),
+    () => [
+      { path: "Note.md", read: async () => "current" },
+      { path: "Empty.md", read: async () => "" },
+      { path: "Long.md", read: async () => "x".repeat(3_000) },
+    ],
+    async (inputs) => {
+      embeddings += inputs.length;
+      return inputs.map(() => [1, 0.1]);
+    },
+    undefined,
+    async () => [[1, 0]],
   );
-  await index.start({ name: "embed", digest: "sha256:abc" });
-  adapter.recordReads = 0;
+  const model = { name: "embed", digest: "sha256:abc" };
+  const index = makeIndex();
+  assert.equal((await index.start(model)).phase, "ready");
+  assert.equal(embeddings, 3);
+  assert.deepEqual([...adapter.recordReads.values()], [1, 1]);
+  assert.equal(decodes, 3);
 
-  assert.equal((await index.retrieve("question"))[0]?.text, "current");
-  assert.equal(adapter.recordReads, 0);
+  const evidence = await index.retrieve("question");
+  assert.equal(evidence.length, 3);
+  assert.equal((await index.retrievePaths(["Note.md"]))[0]?.text, "current");
+  assert.deepEqual(await index.resolveEvidence(evidence[0]), evidence[0]);
+  assert.deepEqual([...adapter.recordReads.values()], [1, 1]);
+  assert.equal(decodes, 3);
+
+  adapter.recordReads.clear();
+  decodes = 0;
+  const restored = makeIndex();
+  assert.equal((await restored.start(model)).phase, "ready");
+  assert.equal(embeddings, 3);
+  assert.deepEqual(await restored.retrieve("question"), evidence);
+  assert.deepEqual([...adapter.recordReads.values()], [1, 1]);
+  assert.equal(decodes, 3);
+
+  adapter.recordReads.clear();
+  decodes = 0;
+  assert.equal((await restored.rebuild(model)).phase, "ready");
+  assert.equal(embeddings, 3);
+  assert.deepEqual([...adapter.recordReads.values()], [1, 1]);
+  assert.equal(decodes, 3);
+  assert.deepEqual(
+    (await restored.retrieve("question")).map(({ citationId, ...item }) => item),
+    evidence.map(({ citationId, ...item }) => item),
+  );
 });
 
 test("mutation work leaves the changed source until after unchanged records are copied", async () => {
@@ -947,28 +993,55 @@ test("invalid embedding vectors never activate a generation", async () => {
   assert.equal(await adapter.exists("plugin/index-v1/active.json"), false);
 });
 
-test("activation revalidates the complete generation after catalog construction", async () => {
-  const adapter = new class extends MemoryAdapter {
-    async write(path, value) {
-      await super.write(path, value);
-      if (!path.endsWith("/catalog.json")) return;
-      const recordPath = [...this.files.keys()].find((item) => item.includes("/records/"));
-      const record = JSON.parse(await this.read(recordPath));
-      record.chunks[0].vector = "corrupt";
-      await super.write(recordPath, JSON.stringify(record));
+test("durable validation rejects corrupt new and reused records before activation", async () => {
+  const corruptions = {
+    base64: (_catalog, record) => { record.chunks[0].vector = "corrupt"; },
+    dimension: (_catalog, record) => { record.chunks[0].vector = encodeVector([1, 2]); },
+    nonfinite: (_catalog, record) => { record.chunks[0].vector = "AACAfw=="; },
+    count: (catalog) => { catalog.entries[0].chunkCount += 1; catalog.entries[0].vectorCount += 1; },
+    vectorCount: (catalog) => { catalog.entries[0].vectorCount += 1; },
+    chunkId: (_catalog, record) => { record.chunks[0].id = "forged"; },
+    locator: (_catalog, record) => { record.chunks[0].locator.path = "Other.md"; },
+    duplicatePath: (catalog) => { catalog.entries.push(catalog.entries[0]); },
+    terminalRecord: (catalog) => { catalog.entries[0].status = "no_extractable_text"; },
+    missingRecord: () => undefined,
+  };
+  for (const [name, corrupt] of Object.entries(corruptions)) {
+    for (const reuse of [false, true]) {
+      const adapter = new class extends MemoryAdapter {
+        armed = !reuse;
+
+        async write(path, value) {
+          await super.write(path, value);
+          if (!this.armed || !path.endsWith("/catalog.json")) return;
+          const catalog = JSON.parse(value);
+          const recordPath = path.replace("catalog.json", catalog.entries[0].record);
+          const record = JSON.parse(this.files.get(recordPath));
+          corrupt(catalog, record);
+          await super.write(path, JSON.stringify(catalog));
+          if (name === "missingRecord") this.files.delete(recordPath);
+          else await super.write(recordPath, JSON.stringify(record));
+        }
+      }();
+      const index = new VaultIndex(
+        adapter,
+        "plugin/index-v1",
+        () => [{ path: "Note.md", read: async () => "text" }],
+        async (inputs) => inputs.map(() => [1]),
+      );
+      const model = { name: "embed", digest: "sha256:abc" };
+      if (reuse) assert.equal((await index.start(model)).phase, "ready");
+      const pointerBefore = adapter.files.get("plugin/index-v1/active.json");
+      adapter.armed = true;
+
+      const result = await index.rebuild(model);
+
+      assert.equal(result.phase, "failed", `${name}, reuse=${reuse}`);
+      assert.equal(adapter.files.get("plugin/index-v1/active.json"), pointerBefore);
+      assert.equal((await index.retrieve("question")).length, reuse ? 1 : 0);
+      assert.equal(generationFolders(adapter).length, reuse ? 1 : 0);
     }
-  }();
-  const index = new VaultIndex(
-    adapter,
-    "plugin/index-v1",
-    () => [{ path: "Note.md", read: async () => "text" }],
-    async (inputs) => inputs.map(() => [1]),
-  );
-
-  const result = await index.start({ name: "embed", digest: "sha256:abc" });
-
-  assert.equal(result.phase, "failed");
-  assert.equal(await adapter.exists("plugin/index-v1/active.json"), false);
+  }
 });
 
 test("restart converges after termination at every durable generation boundary", async () => {
