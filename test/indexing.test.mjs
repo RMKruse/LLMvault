@@ -69,6 +69,29 @@ class MemoryAdapter {
 const generationFolders = (adapter) =>
   [...adapter.folders].filter((path) => path.match(/\/generations\/[^/]+$/));
 
+test("deferred progress outcomes and counters retain their publication state", async () => {
+  const progress = [];
+  const index = new VaultIndex(
+    new MemoryAdapter(), "plugin/index-v1",
+    () => ["A.md", "B.md", "C.md"].map((path) => ({ path, read: async () => "A fact" })),
+    async (inputs) => inputs.map(() => [1]),
+    (snapshot) => { if (snapshot.latestPath) progress.push(snapshot); },
+  );
+  const ready = await index.start({ name: "embed", digest: "digest" });
+  assert.ok(ready.generationId);
+  assert.equal(progress.length, 3);
+  for (const [ordinal, snapshot] of progress.entries()) {
+    assert.equal(snapshot.generationId, undefined, "the first build has no active generation yet");
+    assert.equal(snapshot.completed, ordinal + 1);
+    assert.deepEqual(snapshot.statuses, { indexed: ordinal + 1 });
+    assert.equal(snapshot.outcomes.length, ordinal + 1, "later files do not enter older snapshots");
+  }
+  ready.outcomes[0].path = "tampered";
+  ready.statuses.indexed = 99;
+  assert.equal(index.getSnapshot().outcomes[0].path, "A.md");
+  assert.deepEqual(index.getSnapshot().statuses, { indexed: 3 });
+});
+
 test("evidence batches prepare each source once per stage and reread between stages", async (t) => {
   let reads = 0, enumerations = 0;
   let text = "x".repeat(CHUNK_TARGET_BYTES * 6);
@@ -1061,7 +1084,10 @@ test("Vault mutations tombstone immediately and serialize to the clean final ind
   };
 
   assert.equal(maximumActiveEmbeddings, 1);
-  assert.deepEqual(index.getSnapshot(), clean.getSnapshot());
+  const { generationId, ...snapshot } = index.getSnapshot();
+  const { generationId: cleanGenerationId, ...cleanSnapshot } = clean.getSnapshot();
+  assert.notEqual(generationId, cleanGenerationId);
+  assert.deepEqual(snapshot, cleanSnapshot);
   assert.deepEqual(
     (await index.retrieve("question")).map(withoutCitationId),
     (await clean.retrieve("question")).map(withoutCitationId),

@@ -26,11 +26,26 @@ const EMBEDDING_BATCH_SIZE = 16;
 export interface IndexSnapshot {
   available: boolean;
   completed: number;
+  generationId?: string;
   latestPath?: string;
   outcomes: SourceOutcome[];
   phase: "idle" | "indexing" | "ready" | "failed";
   statuses: Partial<Record<TerminalStatus, number>>;
   total: number;
+}
+
+// Copy counters immediately; materialize file details only when a consumer asks.
+export function copyIndexSnapshot(snapshot: IndexSnapshot): IndexSnapshot {
+  return {
+    available: snapshot.available,
+    completed: snapshot.completed,
+    ...(snapshot.generationId === undefined ? {} : { generationId: snapshot.generationId }),
+    ...(snapshot.latestPath === undefined ? {} : { latestPath: snapshot.latestPath }),
+    get outcomes() { return snapshot.outcomes.map((outcome) => ({ ...outcome })); },
+    phase: snapshot.phase,
+    statuses: { ...snapshot.statuses },
+    total: snapshot.total,
+  };
 }
 
 export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
@@ -119,11 +134,7 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
   }
 
   getSnapshot(): IndexSnapshot {
-    return {
-      ...this.snapshot,
-      outcomes: this.snapshot.outcomes.map((outcome) => ({ ...outcome })),
-      statuses: { ...this.snapshot.statuses },
-    };
+    return copyIndexSnapshot(this.snapshot);
   }
 
   getSignature(): IndexSignature | null {
@@ -308,6 +319,7 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
   }
 
   private update(snapshot: IndexSnapshot): IndexSnapshot {
+    snapshot.generationId = this.active?.generationId;
     this.snapshot = snapshot;
     this.onProgress(this.getSnapshot());
     return this.getSnapshot();
@@ -366,6 +378,7 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
     const generationId = globalThis.crypto.randomUUID();
     await this.storage.create(generationId);
     const entries: SourceEntry[] = [];
+    const statuses: IndexSnapshot["statuses"] = {};
     let catalogCommitted = false;
     const reusable = compatibleSignature(this.active?.signature, model)
       ? new Map(this.active?.entries.map((entry) => [entry.path, entry]))
@@ -416,13 +429,15 @@ export class VaultIndex<Model extends EmbeddingModel = EmbeddingModel> {
           await this.storage.writeRecord(generationId, entry, storedChunks, vectorDimension);
         }
         entries.push(entry);
+        statuses[entry.status] = (statuses[entry.status] ?? 0) + 1;
+        const completed = entries.length;
         this.update({
           available: Boolean(this.active),
-          completed: entries.length,
+          completed,
           latestPath: source.path,
-          outcomes: outcomes(entries),
+          get outcomes() { return outcomes(entries.slice(0, completed)); },
           phase: "indexing",
-          statuses: statusCounts(entries),
+          statuses,
           total: sources.length,
         });
       }

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { createIndexChecks } from "../evaluation/index-acceptance.mjs";
@@ -9,10 +8,9 @@ import { build } from "esbuild";
 import { executeAnswer } from "../src/answer.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "../src/quality.ts";
 
-// Exercise the production view without launching Obsidian or exposing test exports.
-const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+// Exercise the production views without launching Obsidian.
 const { outputFiles } = await build({
-  stdin: { contents: `${source}\nexport { VaultChatView };`, resolveDir: new URL("../src", import.meta.url).pathname, loader: "ts" },
+  stdin: { contents: 'export { VaultChatView } from "./chat-view"; export { default } from "./main";', resolveDir: new URL("../src", import.meta.url).pathname, loader: "ts" },
   bundle: true, write: false, platform: "node", format: "cjs", external: ["obsidian"],
 });
 const module = { exports: {} };
@@ -24,6 +22,13 @@ const { VaultChatView, default: LLMvaultPlugin } = module.exports;
 const deferred = () => Promise.withResolvers();
 class Element {
   children = [];
+  classList = { toggle() {} };
+  addClass() {}
+  focus() {}
+  setText(text) { this.text = text; }
+  setAttribute() {}
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
   empty() { this.children = []; }
   createEl(tag, options = {}) {
     const child = Object.assign(new Element(), { tag, ...options });
@@ -31,6 +36,7 @@ class Element {
     return child;
   }
   createDiv(options) { return this.createEl("div", options); }
+  createSpan(options) { return this.createEl("span", options); }
   find(text) { return this.text === text ? this : this.children.map((child) => child.find(text)).find(Boolean); }
 }
 const discovery = { version: "0.33.2", installedModelCount: 2, chatModels: ["chat"], embeddingModels: ["embed"], remoteModels: [], modelDigests: {} };
@@ -99,13 +105,13 @@ test("failed setup stays in the form while every running batch uses its captured
     const build = plugin.startIndexing({ ...discovery, modelDigests: { embed: "original-digest" } }, "embed");
     await entered.promise;
     const view = new VaultChatView({}, plugin);
-    view.portValue = "11435";
-    view.discovery = discovery;
-    view.renderSetup = () => {};
-    await view.completeSetup();
+    view.management.portValue = "11435";
+    view.management.discovery = discovery;
+    view.management.renderSetup = () => {};
+    await view.management.completeSetup();
     assert.equal(writes, 0);
     assert.deepEqual(plugin.getSettings(), { ollamaPort: 11434, chatModel: "chat", embeddingModel: "embed" });
-    assert.equal(view[failedRole === "completion" ? "chatModel" : "embeddingModel"], null);
+    assert.equal(view.management[failedRole === "completion" ? "chatModel" : "embeddingModel"], null);
     pending.resolve();
     await build;
     assert.deepEqual(ports, [11434, 11434, 11434]);
@@ -133,10 +139,10 @@ test("successful setup replaces a paused build only after durable settings publi
   plugin.saveData = async () => { saving.resolve(); await saved.promise; };
   plugin.ollama.validateModel = async () => "compatible";
   const view = new VaultChatView({}, plugin);
-  view.portValue = "11435";
-  view.discovery = { ...discovery, modelDigests: { embed: "new-digest" } };
-  view.renderSetup = view.showChat = () => {};
-  const setup = view.completeSetup();
+  view.management.portValue = "11435";
+  view.management.discovery = { ...discovery, modelDigests: { embed: "new-digest" } };
+  view.management.renderSetup = view.showChat = () => {};
+  const setup = view.management.completeSetup();
   await saving.promise;
   assert.equal(plugin.getSettings().ollamaPort, 11434);
   saved.resolve();
@@ -245,7 +251,7 @@ function harness() {
   view.renderIncomplete = () => view.renderAnswer("Incomplete");
   view.renderEvidence = () => {};
   view.renderHistory = () => {};
-  view.setupEl = new Element();
+  view.management.setupEl = new Element();
   view.contentEl = new Element();
   return { view, plugin, saved };
 }
@@ -254,15 +260,15 @@ test("discovery finishes after a question and releases setup controls", async ()
   const { view, plugin, saved } = harness();
   const pending = deferred();
   plugin.discoverModels = () => pending.promise;
-  const refresh = view.refreshModels();
-  assert.equal(view.setupEl.find("Checking…").disabled, true);
+  const refresh = view.management.refreshModels();
+  assert.equal(view.management.setupEl.find("Checking…").disabled, true);
   await view.askQuestion();
   pending.resolve(discovery);
   await refresh;
   assert.equal(saved.length, 1);
   assert.equal(view.answering, false);
-  assert.equal(view.busy, false);
-  assert.equal(view.setupEl.find("Complete setup").disabled, false);
+  assert.equal(view.management.busy, false);
+  assert.equal(view.management.setupEl.find("Complete setup").disabled, false);
 });
 
 test("historical evidence resolves in one batch and retains unavailable citations", async () => {
@@ -276,11 +282,215 @@ test("historical evidence resolves in one batch and retains unavailable citation
   let batches = 0;
   plugin.revalidateEvidence = async (items) => { batches += 1; assert.equal(items, stored); return evidence; };
   view.renderEvidence = (items, unavailable) => {
+    if (items.length === 0) return;
     assert.deepEqual(items, stored);
     assert.deepEqual([...unavailable], [missing.citationId]);
   };
   await view.renderSelectedConversation();
   assert.equal(batches, 1);
+});
+
+test("rebuild progress does not reread historical evidence", async () => {
+  const plugin = await indexingPlugin();
+  let reads = 0;
+  plugin.vaultSources = () => [{ path: "Note.md", read: async () => { reads += 1; return "A saved fact"; } }];
+  plugin.indexOllama.embed = async (_port, _model, inputs) => inputs.map(() => [1]);
+  await plugin.startIndexing({ ...discovery, modelDigests: { embed: "digest" } }, "embed");
+  const stored = await plugin.index.retrievePaths(["Note.md"]);
+  assert.equal(stored.length, 1);
+  plugin.getConversationState = () => ({
+    selectedConversationId: "saved",
+    conversations: [{ id: "saved", title: "Saved", turns: [{ evidence: stored, answer: "A saved fact", kind: "answer" }] }],
+  });
+  const restorations = [];
+  plugin.revalidateEvidence = (items) => {
+    const result = plugin.index.resolveEvidenceBatch(items);
+    restorations.push(result);
+    return result;
+  };
+  const view = new VaultChatView({}, plugin);
+  view.contentEl = new Element();
+  view.management.refreshModels = async () => {};
+  await view.onOpen();
+  await Promise.all(restorations);
+  assert.equal(restorations.length, 1, "opening restores once, including the initial subscription snapshot");
+  const before = reads;
+  const snapshot = plugin.getIndexSnapshot();
+  for (let completed = 1; completed <= 1_000; completed += 1) {
+    plugin.reportIndex({
+      ...snapshot, phase: "indexing", total: 1_000, completed,
+      get outcomes() { assert.fail("progress must not materialize file details"); },
+    });
+  }
+  await Promise.all(restorations);
+  assert.equal(reads, before, "progress must not prepare historical sources again");
+  assert.equal(restorations.length, 1);
+  plugin.reportIndex({ ...snapshot, phase: "failed" });
+  assert.equal(restorations.length, 1, "failed rebuilds keep the same available evidence");
+
+  // A real rebuild reads the build source once and the activated history once.
+  await plugin.startIndexing({ ...discovery, modelDigests: { embed: "digest" } }, "embed", true);
+  await Promise.all(restorations);
+  assert.notEqual(plugin.getIndexSnapshot().generationId, snapshot.generationId);
+  assert.equal(restorations.length, 2, "activation refreshes history once");
+  assert.equal(reads, before + 2);
+
+  for (const subscriber of plugin.mutationSubscribers) subscriber(new Set(["Other.md"]));
+  assert.equal(restorations.length, 2, "unrelated source mutations do not restore history");
+  for (const subscriber of plugin.mutationSubscribers) subscriber(new Set(["Note.md"]));
+  await Promise.all(restorations);
+  assert.equal(restorations.length, 3, "a relevant mutation refreshes history");
+  await view.renderSelectedConversation();
+  assert.equal(restorations.length, 4, "explicit selection still revalidates");
+  await view.onClose();
+});
+
+test("index counters leave file details untouched until visible and expanded", () => {
+  const { view, plugin } = harness();
+  let outcomeReads = 0;
+  let snapshot = {
+    available: true, phase: "indexing", total: 1_000, completed: 1,
+    statuses: { unsupported_format: 1 },
+    get outcomes() {
+      outcomeReads += 1;
+      return [{ path: "Image.png", status: "unsupported_format" }];
+    },
+  };
+  plugin.getIndexSnapshot = () => snapshot;
+  view.renderShell();
+  const management = view.management;
+  const details = management.outcomeDetails;
+  for (let completed = 1; completed <= 1_000; completed += 1) {
+    snapshot.completed = completed;
+    management.renderIndex();
+  }
+  assert.equal(outcomeReads, 0, "hidden management does not read file details");
+  management.setVisible(true);
+  assert.match(management.indexStatusEl.text, /Indexing 1000 of 1000/);
+  assert.equal(outcomeReads, 0, "collapsed details need only counters");
+  details.open = true;
+  details.ontoggle();
+  assert.equal(outcomeReads, 1);
+  assert.equal(management.outcomeList.children.length, 1);
+  details.open = false;
+  details.ontoggle();
+  const row = management.outcomeList.children[0];
+  management.renderIndex();
+  assert.equal(management.outcomeDetails, details, "counter updates preserve disclosure state and focus");
+  assert.equal(management.outcomeList.children[0], row);
+  assert.equal(outcomeReads, 1);
+});
+
+test("menu Chat preserves the streaming draft and evidence against late historical restoration", async () => {
+  const { view, plugin, saved } = harness();
+  const historical = [{ ...evidence[0], path: "old.md", text: "Old fact" }];
+  const pending = deferred(), streaming = deferred(), finish = deferred();
+  const restorations = [];
+  plugin.getConversationState = () => ({
+    selectedConversationId: "saved",
+    conversations: [{ id: "saved", title: "Saved", turns: [{
+      evidence: historical, question: "Old question", answer: "Old answer", kind: "answer",
+    }] }],
+  });
+  plugin.getIndexSnapshot = () => ({ available: true, phase: "ready", statuses: {}, outcomes: [], total: 1 });
+  plugin.revalidateEvidence = (items) => {
+    if (items !== historical) return Promise.resolve(items);
+    const restore = pending.promise.then(() => historical);
+    restorations.push(restore);
+    return restore;
+  };
+  plugin.chat = async (_messages, onContent) => {
+    onContent("Draft [S1-1]");
+    streaming.resolve();
+    await finish.promise;
+    onContent(" finished");
+    return { content: "Draft [S1-1] finished" };
+  };
+  view.renderHistory = VaultChatView.prototype.renderHistory;
+  view.renderEvidence = VaultChatView.prototype.renderEvidence;
+  view.renderAnswer = (text, ...args) => {
+    view.renderedAnswer = text;
+    VaultChatView.prototype.renderAnswer.call(view, text, ...args);
+  };
+  view.renderShell(); // Starts a historical restore before the draft takes ownership.
+  view.questionEl.value = "New question";
+  const answer = view.askQuestion();
+  await streaming.promise;
+  view.contentEl.find("☰").onclick();
+  view.historyEl.find("Chat").onclick();
+  pending.resolve();
+  await Promise.all(restorations);
+  try {
+    assert.equal(view.answering, true);
+    assert.equal(view.renderedAnswer, "Draft [S1-1]");
+    assert.equal(view.citationRegistry.get("S1-1").path, "note.md");
+    let opened;
+    plugin.resolveEvidence = async (item) => { opened = item; return item; };
+    view.answerEl.find("S1-1").onclick();
+    assert.equal(opened.path, "note.md", "the draft citation still opens its own evidence");
+    assert.equal(restorations.length, 1, "Chat must not start a restore over a draft");
+  } finally {
+    finish.resolve();
+    await answer;
+  }
+  assert.equal(view.renderedAnswer, "Draft [S1-1] finished");
+  assert.equal(view.citationRegistry.get("S1-1").path, "note.md");
+  assert.equal(saved.length, 1);
+});
+
+test("leaving a saved display invalidates deferred restoration at every navigation boundary", async () => {
+  for (const destination of ["management", "close", "new", "resume", "delete", "delete all"]) {
+    const { view, plugin } = harness();
+    const pending = deferred();
+    let state = {
+      selectedConversationId: "saved",
+      conversations: [{ id: "saved", title: "Saved", turns: [{ evidence, answer: "Old", kind: "answer" }] }],
+    };
+    plugin.getConversationState = () => state;
+    plugin.revalidateEvidence = () => pending.promise;
+    const restore = view.renderSelectedConversation();
+    const selectEmpty = async () => { state = { selectedConversationId: null, conversations: [] }; };
+    plugin.startNewConversation = plugin.selectConversation = plugin.deleteConversation = plugin.deleteAllData = selectEmpty;
+    const navigation = {
+      management: () => view.showManagement(),
+      close: () => view.onClose(),
+      new: () => view.startNewConversation(),
+      resume: () => view.resumeConversation("empty"),
+      delete: () => view.removeConversation("saved"),
+      "delete all": () => view.management.deleteAllData(),
+    };
+    await navigation[destination]();
+    const displayed = view.renderedAnswer;
+    pending.resolve(evidence);
+    await restore;
+    assert.equal(view.renderedAnswer, displayed, destination);
+    assert.equal(view.answering, false, destination);
+  }
+});
+
+test("pending conversation selection neither restores early nor overwrites a newer draft", async () => {
+  const { view, plugin } = harness();
+  const selection = deferred(), streaming = deferred(), finish = deferred();
+  plugin.selectConversation = () => selection.promise;
+  let restores = 0;
+  plugin.revalidateEvidence = async (items) => { restores += 1; return items; };
+  const resume = view.resumeConversation("selected");
+  view.showChat();
+  assert.equal(restores, 0);
+  plugin.chat = async (_messages, onContent) => {
+    onContent("Draft");
+    streaming.resolve();
+    await finish.promise;
+    return { content: "Draft" };
+  };
+  const answer = view.askQuestion();
+  await streaming.promise;
+  selection.resolve();
+  await resume;
+  assert.equal(view.renderedAnswer, "Draft");
+  assert.equal(view.answering, true);
+  finish.resolve();
+  await answer;
 });
 
 test("production saves lowercase insufficient_evidence as abstention", async () => {
@@ -303,9 +513,9 @@ test("discovery can finish during streaming without canceling the answer", async
   };
   const answer = view.askQuestion();
   await started.promise;
-  await view.refreshModels();
+  await view.management.refreshModels();
   assert.equal(view.answering, true);
-  assert.equal(view.setupEl.find("Complete setup").disabled, false);
+  assert.equal(view.management.setupEl.find("Complete setup").disabled, false);
   pending.resolve();
   await answer;
   assert.equal(saved[0].answer, "Finished");
@@ -323,7 +533,7 @@ test("cancellation at each answer boundary suppresses late output and persistenc
       return original(...args);
     };
     plugin.discoverModels = () => discovered.promise;
-    const refresh = view.refreshModels();
+    const refresh = view.management.refreshModels();
     const answer = view.askQuestion();
     await entered.promise;
     view.cancelAnswer();
@@ -331,10 +541,10 @@ test("cancellation at each answer boundary suppresses late output and persistenc
     await answer;
     assert.equal(view.renderedAnswer, "Incomplete", stage);
     assert.equal(saved.length, 0, stage);
-    assert.equal(view.busy, true, stage);
+    assert.equal(view.management.busy, true, stage);
     discovered.resolve(discovery);
     await refresh;
-    assert.equal(view.setupEl.find("Complete setup").disabled, false, stage);
+    assert.equal(view.management.setupEl.find("Complete setup").disabled, false, stage);
   }
 });
 
@@ -369,16 +579,16 @@ test("closing the view suppresses late setup UI and unsubmitted configuration", 
     plugin.saveSettings = async () => { applied = true; };
     const original = plugin[stage];
     plugin[stage] = async (...args) => { entered.resolve(); await pending.promise; return original(...args); };
-    view.discovery = discovery;
+    view.management.discovery = discovery;
     view.showChat = () => { shown = true; };
-    const setup = stage === "discoverModels" ? view.refreshModels() : view.completeSetup();
+    const setup = stage === "discoverModels" ? view.management.refreshModels() : view.management.completeSetup();
     await entered.promise;
     await view.onClose();
-    const statusAtClose = view.status;
+    const statusAtClose = view.management.status;
     pending.resolve();
     await setup;
-    assert.equal(view.status, statusAtClose, stage);
-    assert.equal(view.busy, false, stage);
+    assert.equal(view.management.status, statusAtClose, stage);
+    assert.equal(view.management.busy, false, stage);
     assert.equal(shown, false, stage);
     assert.equal(applied, stage === "saveSettings", stage);
   }

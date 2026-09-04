@@ -62,7 +62,7 @@ test("calibration keeps every gold unit and is scoped to one embedding digest", 
 });
 
 test("model selection remains user-controlled without an unearned quality claim", async () => {
-  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/management-view.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /evaluated configuration|recommended model/i);
   assert.match(source, /Choose a compatible chat model/);
   assert.match(source, /Choose a compatible embedding model/);

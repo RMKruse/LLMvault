@@ -154,7 +154,7 @@ test("hostile questions, evidence, and model output render as text with registry
   view.renderEvidence([evidence]);
   view.renderAnswer(`${hostileContent}\nKnown [S1-1].`, hostileContent, hostileContent);
   const modelField = new Element();
-  view.createModelSelect(modelField, "model", "Model", "Choose", [hostileContent], null);
+  view.management.createModelSelect(modelField, "model", "Model", "Choose", [hostileContent], null);
 
   const activeTags = new Set(["a", "audio", "embed", "iframe", "img", "object", "script", "source", "video"]);
   assert.deepEqual(answer.findAll((element) => activeTags.has(element.tag)), []);
