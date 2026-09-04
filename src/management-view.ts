@@ -18,6 +18,8 @@ const RECOVERY_MESSAGES: Record<OllamaErrorCode, string> = {
     "The saved embedding model is missing, changed, or no longer supports embeddings. Select it again to rebuild the index.",
   invalid_request:
     "Ollama rejected the request. Refresh the installed models and retry.",
+  context_budget_exceeded:
+    "The question and current evidence exceed the request budget. Shorten or narrow the question and retry.",
   rate_limited: "Ollama is busy. Retry later.",
   ollama_server_error: "Ollama reported a server error. Retry.",
   invalid_response:

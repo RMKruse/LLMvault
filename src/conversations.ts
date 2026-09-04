@@ -117,16 +117,30 @@ export function normalizeConversationState(value: unknown): ConversationState {
   };
 }
 
-export function conversationMessages(conversation?: Conversation): OllamaMessage[] {
-  return conversation?.turns.flatMap((turn) => [
-    conversationUserMessage(turn.question, turn.evidence),
-    {
-      role: "assistant" as const,
-      content: turn.kind === "insufficient"
-        ? `${INSUFFICIENT_PREFIX} ${turn.answer}`
-        : turn.answer,
-    },
-  ]) ?? [];
+// One byte for a separator per message; the complete JSON array costs one more byte.
+export const messageBytes = (message: OllamaMessage): number =>
+  new TextEncoder().encode(JSON.stringify(message)).byteLength + 1;
+
+/** Project a contiguous recent suffix of complete turns without changing the archive. */
+export function conversationMessages(turns: readonly CompletedTurn[], budgetBytes: number): OllamaMessage[] {
+  const pairs: OllamaMessage[][] = [];
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i]!;
+    const pair: OllamaMessage[] = [
+      conversationUserMessage(turn.question, turn.evidence),
+      {
+        role: "assistant",
+        content: turn.kind === "insufficient"
+          ? `${INSUFFICIENT_PREFIX} ${turn.answer}`
+          : turn.answer,
+      },
+    ];
+    const bytes = pair.reduce((sum, message) => sum + messageBytes(message), 0);
+    if (bytes > budgetBytes) break;
+    budgetBytes -= bytes;
+    pairs.push(pair);
+  }
+  return pairs.reverse().flat();
 }
 
 export function conversationUserMessage(

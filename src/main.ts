@@ -25,7 +25,6 @@ import {
   type CompletedTurn,
   type ConversationState,
   completeTurn,
-  conversationMessages,
   deleteConversation,
   newConversation,
   normalizeConversationState,
@@ -177,10 +176,8 @@ export default class LLMvaultPlugin extends Plugin {
     return normalizeConversationState(this.conversationState);
   }
 
-  getConversationMessages(id: string | null): OllamaMessage[] {
-    return conversationMessages(
-      this.conversationState.conversations.find((conversation) => conversation.id === id),
-    );
+  getConversationTurns(id: string | null): readonly CompletedTurn[] {
+    return this.conversationState.conversations.find((conversation) => conversation.id === id)?.turns ?? [];
   }
 
   async answerQuestion(
@@ -196,7 +193,7 @@ export default class LLMvaultPlugin extends Plugin {
     try {
       const result = await executeAnswer(this, {
         question, requestedAt, timeZone,
-        history: this.getConversationMessages(conversationId),
+        history: this.getConversationTurns(conversationId),
         dailyRecapDate: this.dailyRecapRequest(question, requestedAt, timeZone)?.date,
         signal: controller.signal,
         ...callbacks,

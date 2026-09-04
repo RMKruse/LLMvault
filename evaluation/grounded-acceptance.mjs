@@ -1,5 +1,6 @@
 import { createIndexChecks } from "./index-acceptance.mjs";
-import { conversationUserMessage } from "../src/conversations.ts";
+import { conversationMessages, conversationUserMessage, messageBytes } from "../src/conversations.ts";
+import { MAX_PROMPT_BYTES } from "../src/answer.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "../src/quality.ts";
 import { hash, observeRequest, retrievalIdentity, same, supportBinding } from "./proof.mjs";
 
@@ -76,7 +77,7 @@ export async function groundedCase(question, history, indexChecks = createIndexC
   };
   try {
     if (history) await ask("Summarize today and yesterday.");
-    const prior = plugin.getConversationMessages(plugin.getConversationState().selectedConversationId);
+    const prior = plugin.getConversationTurns(plugin.getConversationState().selectedConversationId);
     observations.requests = [];
     observations.pathSelections = [];
     observations.queryEmbeddings = 0;
@@ -113,8 +114,10 @@ export function summarizeGrounded(raw, configuration, id, repetition) {
   const citedIds = [...response.matchAll(/\[(S\d+-\d+)\]/g)].map((match) => match[1]);
   const cited = evidence.filter(({ citationId }) => citedIds.includes(citationId));
   const proposition = (text) => /SURE/i.test(text) && /local|lokal/i.test(text) && /partial derivatives|partielle[nr]? Ableitungen/i.test(text);
-  const messages = [{ role: "system", content: GROUNDING_SYSTEM_PROMPT }, ...(raw.prior ?? []),
-    conversationUserMessage(raw.question, evidence, id === "daily" ? "2026.09.02" : undefined)];
+  const system = { role: "system", content: GROUNDING_SYSTEM_PROMPT };
+  const current = conversationUserMessage(raw.question, evidence, id === "daily" ? "2026.09.02" : undefined);
+  const budget = MAX_PROMPT_BYTES - 1 - messageBytes(system) - messageBytes(current);
+  const messages = [system, ...conversationMessages(raw.prior ?? [], budget), current];
   const modelDigestsPass = [raw.modelsBefore, raw.modelsAfter].every((tags) =>
     [configuration.chatModel, configuration.embeddingModel].every(({ name, digest }) =>
       tags?.models?.some((model) => (model.name === name || model.model === name) && model.digest === digest)));

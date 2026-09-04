@@ -42,6 +42,7 @@ export type OllamaErrorCode =
   | "chat_model_unavailable"
   | "embedding_model_unavailable"
   | "invalid_request"
+  | "context_budget_exceeded"
   | "rate_limited"
   | "ollama_server_error"
   | "invalid_response"

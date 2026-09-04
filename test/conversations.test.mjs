@@ -5,6 +5,7 @@ import {
   completeTurn,
   conversationMessages,
   conversationUserMessage,
+  messageBytes,
   deleteConversation,
   newConversation,
   normalizeConversationState,
@@ -120,7 +121,7 @@ test("completed turns preserve per-turn evidence in application-owned chat histo
   );
 
   assert.equal(state.selectedConversationId, "conversation-1");
-  assert.deepEqual(conversationMessages(state.conversations[0]), [
+  assert.deepEqual(conversationMessages(state.conversations[0].turns, 32 * 1024), [
     {
       role: "user",
       content:
@@ -142,6 +143,20 @@ test("Daily Recap current messages include the resolved date", () => {
         '[{"citationId":"S1-1","text":"Stored evidence"}]',
     },
   );
+});
+
+test("history projection fits whole turns and stops before serializing the older archive", () => {
+  const recent = { ...turn, kind: "insufficient", answer: "No support" };
+  const expected = [conversationUserMessage(recent.question, recent.evidence),
+    { role: "assistant", content: "INSUFFICIENT_EVIDENCE: No support" }];
+  const budget = expected.reduce((sum, message) => sum + messageBytes(message), 0);
+  const older = { get question() { throw new Error("must not serialize the full archive"); } };
+  const oversized = { ...turn, question: "x".repeat(budget) };
+  const turns = [older, oversized, recent];
+  assert.deepEqual(conversationMessages(turns, budget), expected);
+  assert.deepEqual(conversationMessages(turns, budget - 1), []);
+  assert.deepEqual(conversationMessages(turns, 0), []);
+  assert.deepEqual(conversationMessages([], budget), []);
 });
 
 test("new, select, and delete change selection without rewriting prior records", () => {

@@ -5,7 +5,8 @@ import { createIndexChecks } from "../evaluation/index-acceptance.mjs";
 import { groundedCase } from "../evaluation/grounded-acceptance.mjs";
 import { installRecoveryWatch, rendererExpression, rendererSetup } from "../evaluation/obsidian-acceptance.mjs";
 import { build } from "esbuild";
-import { executeAnswer } from "../src/answer.ts";
+import { executeAnswer, MAX_PROMPT_BYTES } from "../src/answer.ts";
+import { conversationUserMessage } from "../src/conversations.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "../src/quality.ts";
 
 // Exercise the production views without launching Obsidian.
@@ -230,7 +231,7 @@ function harness() {
     isStopped: () => false,
     isDeletionIncomplete: () => false,
     getConversationState: () => ({ conversations: [], selectedConversationId: null }),
-    getConversationMessages: () => [],
+    getConversationTurns: () => [],
     getIndexSnapshot: () => ({ available: true }),
     dailyRecapRequest: () => null,
     abortAnswerRequests: LLMvaultPlugin.prototype.abortAnswerRequests,
@@ -610,7 +611,7 @@ test("shared execution and production persistence agree on answer classification
 
 test("shared execution assembles history, Daily Recap context and streams accumulated content", async () => {
   const { plugin } = harness();
-  const history = [{ role: "user", content: "Earlier question" }, { role: "assistant", content: "Earlier answer" }];
+  const history = [{ question: "Earlier question", answer: "Earlier answer", kind: "answer", evidence: [], status: "complete", completedAt: 0 }];
   const requestedAt = new Date(0), updates = [];
   plugin.retrieve = async (question, now, timeZone) => {
     assert.equal(now, requestedAt);
@@ -618,7 +619,10 @@ test("shared execution assembles history, Daily Recap context and streams accumu
     return evidence;
   };
   plugin.chat = async (messages, onContent) => {
-    assert.deepEqual(messages.slice(0, 3), [{ role: "system", content: GROUNDING_SYSTEM_PROMPT }, ...history]);
+    assert.deepEqual(messages.slice(0, 3), [
+      { role: "system", content: GROUNDING_SYSTEM_PROMPT },
+      conversationUserMessage("Earlier question", []), { role: "assistant", content: "Earlier answer" },
+    ]);
     assert.match(messages[3].content, /Resolved Daily Recap date: 2026-09-02/);
     assert.match(messages[3].content, /UNTRUSTED_EVIDENCE_JSON/);
     onContent("A "); onContent("fact");
@@ -631,6 +635,72 @@ test("shared execution assembles history, Daily Recap context and streams accumu
   });
   assert.deepEqual(updates, ["", "A ", "A fact"]);
   assert.equal(result.chatResult.diagnostics.eval_count, 2);
+});
+
+test("long saved conversations keep their archive while model messages stay within 32 KiB", async () => {
+  const plugin = new LLMvaultPlugin();
+  const turns = Array.from({ length: 50 }, (_, i) => ({
+    question: `Question ${i}`, answer: `Answer ${i}`, kind: "answer", status: "complete", completedAt: i,
+    evidence: Array.from({ length: 6 }, (_, j) => ({
+      citationId: `S${i + 1}-${j + 1}`, chunkId: `chunk-${j}`, fingerprint: "source", score: 1,
+      format: "markdown", path: "note.md", start: 0, end: 2048, startLine: 1, endLine: 1,
+      text: "x".repeat(2048),
+    })),
+  }));
+  const archive = { conversations: [{ id: "saved", title: "Saved", createdAt: 0, updatedAt: 49, turns }], selectedConversationId: "saved" };
+  plugin.conversationState = structuredClone(archive);
+  let persisted, dispatched;
+  plugin.saveData = async (data) => { persisted = structuredClone(data); };
+  plugin.validateChatModel = async () => {};
+  plugin.retrieve = async () => turns[0].evidence;
+  plugin.revalidateEvidence = async (items) => items;
+  plugin.dailyRecapRequest = () => null;
+  plugin.chat = async (messages) => { dispatched = messages; return { content: "Current answer" }; };
+  await plugin.answerQuestion("Current question", "saved", {});
+  assert.deepEqual(plugin.getConversationState().conversations[0].turns.slice(0, 50), turns);
+  assert.ok(persisted, "the completed answer must be durably saved");
+  assert.deepEqual(persisted.conversations[0].turns.slice(0, 50), turns);
+  assert.equal(plugin.getConversationState().conversations[0].turns.length, 51);
+  const bytes = Buffer.byteLength(JSON.stringify(dispatched));
+  assert.ok(bytes <= 32 * 1024, `model messages used ${bytes} bytes`);
+  assert.equal(dispatched[0].content, GROUNDING_SYSTEM_PROMPT);
+  assert.equal(dispatched.at(-2).content, "Answer 49");
+  assert.match(dispatched.at(-1).content, /^Current question/);
+  assert.deepEqual(dispatched.at(-1), conversationUserMessage("Current question", turns[0].evidence));
+});
+
+test("prompt budget counts UTF-8 and JSON escaping and rejects oversized current requests", async () => {
+  const { plugin } = harness();
+  const history = Array.from({ length: 30 }, (_, i) => ({
+    question: `Earlier ${i}: ${'😀\n"\\'.repeat(160)}`, answer: `Answer ${i}`, kind: "answer",
+    evidence: [], status: "complete", completedAt: i,
+  }));
+  const request = { question: "Current", requestedAt: new Date(0), timeZone: "UTC", history, signal: new AbortController().signal };
+  let dispatched;
+  plugin.chat = async (messages) => { dispatched = messages; return { content: "Answer" }; };
+  await executeAnswer(plugin, request);
+  assert.ok(Buffer.byteLength(JSON.stringify(dispatched)) <= MAX_PROMPT_BYTES);
+  assert.ok(dispatched.length > 4 && dispatched.length < 62);
+  const suffix = dispatched.slice(1, -1);
+  const included = history.slice(-suffix.length / 2);
+  assert.deepEqual(suffix, included.flatMap((turn) => [
+    conversationUserMessage(turn.question, []), { role: "assistant", content: turn.answer },
+  ]));
+
+  const base = [{ role: "system", content: GROUNDING_SYSTEM_PROMPT }, conversationUserMessage("", evidence)];
+  request.question = "x".repeat(MAX_PROMPT_BYTES - Buffer.byteLength(JSON.stringify(base)));
+  await executeAnswer(plugin, request);
+  assert.equal(dispatched.length, 2, "current evidence consumes the history allowance");
+  assert.equal(Buffer.byteLength(JSON.stringify(dispatched)), MAX_PROMPT_BYTES);
+  dispatched = undefined;
+  request.question += "x";
+  await assert.rejects(executeAnswer(plugin, request), { code: "context_budget_exceeded" });
+  assert.equal(dispatched, undefined);
+
+  request.question = "Current";
+  plugin.retrieve = async () => [{ ...evidence[0], text: "x".repeat(MAX_PROMPT_BYTES) }];
+  await assert.rejects(executeAnswer(plugin, request), { code: "context_budget_exceeded" });
+  assert.equal(dispatched, undefined);
 });
 
 test("empty evidence abstains; changed evidence and failed streams never save a turn", async () => {

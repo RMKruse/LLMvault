@@ -23,6 +23,8 @@ The plugin sends no telemetry, analytics, crash reports, update checks, remote l
 
 Chat history and retained connection settings live in `<vault>/<config-folder>/plugins/llmvault/data.json`; the default Obsidian configuration folder is `.obsidian`. The derived index lives beside it in `index-v1/` and contains source identities, locations, statuses, and embeddings, but no persisted plaintext source copy.
 
+The full conversation archive is retained locally. Model messages use a separate 32 KiB budget, measured as the UTF-8 JSON message array. The system instructions and current question/evidence take priority; remaining space holds whole recent turns, in order, stopping at the first turn that does not fit. If the current request alone exceeds the budget, Vault Chat asks you to shorten or narrow the question. This byte limit bounds request growth; it does not guarantee a fit in every Local Model's token context window.
+
 Vault-level or configuration-folder sync and backup software may copy this plugin data. User-created vault symlinks or junctions may also point to files physically outside the vault even though LLMvault uses only vault-relative identities exposed by Obsidian.
 
 **Delete all Vault Chat data** stops current work and removes plugin-owned indexes, conversations, statuses, caches, temporary records, and in-memory content. It keeps the Ollama port and model selections so the connection can be reused. It does not delete Vault Content, Ollama models or logs, Obsidian/OS state, sync history, external backups, or storage-device remnants, and it is not a secure-erasure feature.

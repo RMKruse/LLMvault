@@ -1,13 +1,16 @@
-import { type CompletedTurn, conversationUserMessage } from "./conversations.ts";
+import { type CompletedTurn, conversationMessages, conversationUserMessage, messageBytes } from "./conversations.ts";
 import type { RetrievedEvidence } from "./indexing.ts";
 import { OllamaError, type OllamaChatResult, type OllamaMessage } from "./ollama.ts";
 import { GROUNDING_SYSTEM_PROMPT } from "./quality.ts";
+
+// ponytail: serialized UTF-8 byte cap, not token accounting; use the model's tokenizer if exact context fitting is needed.
+export const MAX_PROMPT_BYTES = 32 * 1024;
 
 export interface AnswerRequest {
   question: string;
   requestedAt: Date;
   timeZone: string;
-  history: OllamaMessage[];
+  history: readonly CompletedTurn[];
   dailyRecapDate?: string;
   signal: AbortSignal;
   onEvidence?: (evidence: RetrievedEvidence[]) => void;
@@ -61,11 +64,11 @@ export async function executeAnswer(
     };
   }
 
-  const messages: OllamaMessage[] = [
-    { role: "system", content: GROUNDING_SYSTEM_PROMPT },
-    ...request.history,
-    conversationUserMessage(question, evidence, request.dailyRecapDate),
-  ];
+  const system: OllamaMessage = { role: "system", content: GROUNDING_SYSTEM_PROMPT };
+  const current = conversationUserMessage(question, evidence, request.dailyRecapDate);
+  const historyBudget = MAX_PROMPT_BYTES - 1 - messageBytes(system) - messageBytes(current);
+  if (historyBudget < 0) throw new OllamaError("context_budget_exceeded", "/api/chat");
+  const messages = [system, ...conversationMessages(request.history, historyBudget), current];
   let streamed = "";
   request.onContent?.(streamed);
   checkCanceled();
