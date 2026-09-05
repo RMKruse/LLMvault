@@ -30,7 +30,10 @@ assert.equal(rebuild.status, 0, rebuild.stderr || rebuild.stdout);
 const secondBundle = await read("main.js");
 assert.equal(digest(secondBundle), digest(firstBundle), "production build is not reproducible");
 assert.deepEqual(
-  [...secondBundle.toString().matchAll(/require\(\"([^\"]+)\"\)/g)].map((match) => match[1]),
+  [...new Set(Array.from(
+    secondBundle.toString().matchAll(/require\(\"([^\"]+)\"\)/g),
+    (match) => match[1],
+  ))],
   ["obsidian"],
 );
 

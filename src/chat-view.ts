@@ -485,7 +485,7 @@ export class VaultChatView extends ItemView {
     if (this.questionEl) this.questionEl.disabled = this.answering || !ready;
     if (this.askButton) {
       this.askButton.disabled = !this.answering && !ready;
-      this.askButton.setText(this.answering ? "Stop" : "Ask");
+      this.askButton.setText(this.answering ? "Working… Stop" : "Ask");
       if (this.answering) this.askButton.focus();
     }
   }
